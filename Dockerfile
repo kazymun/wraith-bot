@@ -1,6 +1,5 @@
-FROM rust:latest
+FROM rust:1.86
 WORKDIR /app
 COPY . .
-RUN cargo update
 RUN cargo build --release
 CMD ["./target/release/wraith-bot"]
