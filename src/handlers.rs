@@ -219,7 +219,7 @@ impl App {
                     u.awaiting = Awaiting::SettingPin;
                     self.db.save_user(&u)?;
                     self.tg.send_html(chat_id,
-                        "👻 <b>Welcome to Wraith</b>\n\nA real Solana wallet has just been created for you. Set a 4-digit PIN to protect withdrawals and key export.\n\nReply with your PIN (e.g. 1234):",
+                        "👻 <b>Welcome to Wraith</b>\n\nA real Solana wallet has been created for you.\n\n⚠️ <b>Important — read this once:</b>\nThis is a <b>custodial</b> wallet. Your private key is encrypted and stored on our server. The bot operator controls the master key. Only deposit funds you're comfortable with this arrangement.\n\nYou can export your private key anytime via Wallet → Export Private Key and move to your own wallet.\n\nNow set a 4-digit PIN to protect withdrawals and key export:\n\nReply with your PIN (e.g. 1234):",
                         None,
                     ).await?;
                 } else {
