@@ -34,6 +34,12 @@ async fn main() -> anyhow::Result<()> {
 
     println!("👻 Wraith bot is running...");
 
+    // Spawn background gem scanner
+    let scanner_app = app.clone();
+    tokio::spawn(async move {
+        scanner_app.run_gem_scanner().await;
+    });
+
     let mut offset: i64 = 0;
     loop {
         let updates = match app.tg.get_updates(offset).await {

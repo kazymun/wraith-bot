@@ -40,6 +40,10 @@ fn default_decimals() -> u8 {
     9
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub telegram_id: i64,
@@ -53,6 +57,8 @@ pub struct UserRecord {
     pub ref_code: String,
     pub refs: u32,
     pub created_at: i64,
+    #[serde(default = "default_true")]
+    pub gem_alerts: bool,
 }
 
 impl UserRecord {
@@ -69,6 +75,7 @@ impl UserRecord {
             ref_code: format!("WRAITH_{}", telegram_id % 1_000_000),
             refs: 0,
             created_at: chrono_now(),
+            gem_alerts: true,
         }
     }
 }

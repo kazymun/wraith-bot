@@ -49,10 +49,12 @@ pub fn wallet_menu() -> Keyboard {
     ]
 }
 
-pub fn settings_menu() -> Keyboard {
+pub fn settings_menu(gem_alerts: bool) -> Keyboard {
+    let gem_label = if gem_alerts { "🔔 Gem Alerts: ON" } else { "🔕 Gem Alerts: OFF" };
     vec![
         vec![btn("🔑 Change PIN", "change_pin")],
         vec![btn("📊 Slippage", "slippage")],
+        vec![btn(gem_label, "toggle_gem_alerts")],
         vec![btn("🏠 Main Menu", "main")],
     ]
 }

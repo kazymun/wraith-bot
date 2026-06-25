@@ -14,6 +14,7 @@ use solana_sdk::system_instruction;
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use std::str::FromStr;
 
+#[derive(Clone)]
 pub struct App {
     pub tg: TgClient,
     pub db: Db,
@@ -447,7 +448,13 @@ impl App {
                 self.handle_gem_scan(chat_id).await?;
             }
             "settings" => {
-                self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu())).await?;
+                self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu(user.gem_alerts))).await?;
+            }
+            "toggle_gem_alerts" => {
+                user.gem_alerts = !user.gem_alerts;
+                self.db.save_user(&user)?;
+                let status = if user.gem_alerts { "🔔 Gem alerts <b>enabled</b> — you'll be notified when new gems are found." } else { "🔕 Gem alerts <b>disabled</b> — you won't receive gem notifications." };
+                self.tg.send_html(chat_id, status, Some(kb::settings_menu(user.gem_alerts))).await?;
             }
             "change_pin" => {
                 if user.pin_hash.is_some() {
@@ -467,8 +474,13 @@ impl App {
                 self.tg.send_html(chat_id, "👥 <b>Referral Program</b>\n\nComing soon.", Some(kb::main_only())).await?;
             }
             other if other.starts_with("buyamt_") => {
-                // Check if user selected custom amount
-                if other.ends_with("_custom") {
+                if other.ends_with("_custom_prompt") {
+                    // Quick buy from gem scanner — ca is between buyamt_ and _custom_prompt
+                    let ca = other.trim_start_matches("buyamt_").trim_end_matches("_custom_prompt");
+                    user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "✏️ How much SOL do you want to spend? (e.g. <code>0.5</code>):", Some(kb::cancel_to("main"))).await?;
+                } else if other.ends_with("_custom") {
                     let ca = other.trim_start_matches("buyamt_").trim_end_matches("_custom");
                     user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
                     self.db.save_user(&user)?;
@@ -711,6 +723,104 @@ impl App {
         Ok(())
     }
 
+    async fn ai_gem_narrative(&self, name: &str, symbol: &str, mc: &str, liq: &str, change1h: f64, score: i32) -> String {
+        let prompt = format!(
+            "You are a crypto analyst specializing in Solana memecoins and narrative trading.\n\nAnalyze this token and respond in exactly this format (no extra text):\nNARRATIVE: [one of: AI, Meme, DePIN, Gaming, RWA, DeFi, Infrastructure, Animal, Political, Pop Culture, Unknown]\nDESCRIPTION: [1 sentence max — what is this token about]\nWHY NOW: [1 sentence — why could this pump right now]\nRISK: [1 sentence — main risk]\nUPSIDE: [X-Y]x\n\nToken: {name} (${symbol})\nMarket Cap: {mc}\nLiquidity: {liq}\n1h Change: {change1h:.1}%\nSafety Score: {score}/100"
+        );
+
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 200,
+            "messages": [{ "role": "user", "content": prompt }]
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    v["content"][0]["text"].as_str().unwrap_or("").to_string()
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => String::new(),
+        }
+    }
+
+    pub async fn run_gem_scanner(&self) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await; // scan every 5 mins
+
+            let pairs = match dexscreener::get_trending_solana_pairs().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            for pair in &pairs {
+                let ca = match pair["baseToken"]["address"].as_str() {
+                    Some(a) => a.to_string(),
+                    None => continue,
+                };
+                if seen.contains(&ca) { continue; }
+
+                let a = dexscreener::analyze(pair);
+                if a.score < 65 { continue; } // only high-confidence gems
+
+                seen.insert(ca.clone());
+                if seen.len() > 500 { seen.clear(); } // prevent memory bloat
+
+                let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
+                let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
+                let mc = pair["fdv"].as_f64().map(|v| {
+                    if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
+                    else { format!("${:.0}K", v / 1_000.0) }
+                }).unwrap_or_else(|| "N/A".to_string());
+                let liq = pair["liquidity"]["usd"].as_f64()
+                    .map(|v| format!("${:.0}K", v / 1_000.0))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
+                let upside = if a.score >= 80 { "🚀 High potential" } else { "⚡ Moderate potential" };
+
+                // Generate AI narrative
+                let narrative = self.ai_gem_narrative(name, symbol, &mc, &liq, change1h, a.score).await;
+                let narrative_section = if !narrative.is_empty() {
+                    format!("\n\n📖 <b>AI Analysis:</b>\n<i>{narrative}</i>")
+                } else {
+                    String::new()
+                };
+
+                let msg = format!(
+                    "💎 <b>Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100\n🎯 {upside}{narrative_section}\n\n<i>Tap buy to trade instantly 👇</i>",
+                    a.score
+                );
+                let kb = vec![
+                    vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("buyamt_{ca}_custom_prompt"))],
+                    vec![crate::telegram::btn("❌ Skip", "main")],
+                ];
+
+                // Send to all users with gem_alerts enabled
+                for item in self.db.inner_iter() {
+                    if let Ok((_, bytes)) = item {
+                        if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
+                            if user.gem_alerts {
+                                self.tg.send_html(user.telegram_id, &msg, Some(kb.clone())).await.ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_pnl(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let user = self.get_or_create_user(telegram_id)?;
         if user.positions.is_empty() {
@@ -858,13 +968,33 @@ impl App {
                 else if *score >= 55 { "⚡ Moderate (2–5x potential)" }
                 else { "👀 Speculative (DYOR)" };
 
+            // Generate AI narrative
+            let ai = self.ai_gem_narrative(name, symbol, &mc, &liq, change1h, *score).await;
+            let ai_section = if !ai.is_empty() {
+                format!("\n📖 <b>AI Take:</b>\n<i>{ai}</i>\n")
+            } else {
+                String::new()
+            };
+
             msg += &format!(
-                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n📖 <i>{narrative}</i>\n🎯 Upside: {upside}\n\n"
+                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n{ai_section}🎯 Upside: {upside}\n\n"
             );
         }
         msg += "⚠️ <i>Not financial advice. Always DYOR before buying.</i>";
 
-        self.tg.send_html(chat_id, &msg, Some(kb::ai_tools_menu())).await?;
+        // Build keyboard with quick buy buttons for each gem
+        let mut kb: Vec<Vec<crate::telegram::InlineButton>> = vec![];
+        for (pair, score, _) in gems.iter().take(5) {
+            let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
+            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
+            let stars = if *score >= 70 { "🚀" } else if *score >= 55 { "⚡" } else { "👀" };
+            kb.push(vec![
+                crate::telegram::btn(&format!("{stars} Buy ${symbol}"), &format!("buyamt_{ca}_custom_prompt")),
+            ]);
+        }
+        kb.push(vec![crate::telegram::btn("🏠 Main Menu", "main")]);
+
+        self.tg.send_html(chat_id, &msg, Some(kb)).await?;
         Ok(())
     }
 

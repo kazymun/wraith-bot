@@ -31,6 +31,10 @@ impl Db {
         Ok(())
     }
 
+    pub fn inner_iter(&self) -> sled::Iter {
+        self.inner.iter()
+    }
+
     /// Look up a user record by their referral code (linear scan - fine for
     /// small/medium user counts, replace with an index if you scale up).
     pub fn find_by_ref_code(&self, ref_code: &str) -> Result<Option<UserRecord>> {
