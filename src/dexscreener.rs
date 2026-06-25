@@ -11,19 +11,35 @@ pub async fn get_token_pair(ca: &str) -> Result<Option<Value>> {
 }
 
 pub async fn get_trending_solana_pairs() -> Result<Vec<Value>> {
-    // Use search endpoint for trending Solana tokens — much faster
-    let url = "https://api.dexscreener.com/latest/dex/search?q=solana";
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(8))
         .build()?;
-    let resp: Value = client.get(url).send().await?.json().await?;
-    Ok(resp["pairs"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+
+    // Get boosted tokens list
+    let boosts: serde_json::Value = client
+        .get("https://api.dexscreener.com/token-boosts/latest/v1")
+        .send().await?.json().await?;
+
+    let addrs: Vec<String> = boosts.as_array()
+        .cloned().unwrap_or_default()
+        .into_iter()
+        .filter(|t| t["chainId"].as_str() == Some("solana"))
+        .take(6)
+        .filter_map(|t| t["tokenAddress"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    if addrs.is_empty() { return Ok(vec![]); }
+
+    // Batch fetch all pairs in one call
+    let joined = addrs.join(",");
+    let url = format!("https://api.dexscreener.com/latest/dex/tokens/{joined}");
+    let resp: serde_json::Value = client.get(&url).send().await?.json().await?;
+
+    Ok(resp["pairs"].as_array()
+        .cloned().unwrap_or_default()
         .into_iter()
         .filter(|p| p["chainId"].as_str() == Some("solana"))
-        .take(10)
+        .take(6)
         .collect())
 }
 

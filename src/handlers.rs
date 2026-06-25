@@ -968,16 +968,8 @@ impl App {
                 else if *score >= 55 { "⚡ Moderate (2–5x potential)" }
                 else { "👀 Speculative (DYOR)" };
 
-            // Generate AI narrative
-            let ai = self.ai_gem_narrative(name, symbol, &mc, &liq, change1h, *score).await;
-            let ai_section = if !ai.is_empty() {
-                format!("\n📖 <b>AI Take:</b>\n<i>{ai}</i>\n")
-            } else {
-                String::new()
-            };
-
             msg += &format!(
-                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n{ai_section}🎯 Upside: {upside}\n\n"
+                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n🎯 {upside}\n\n"
             );
         }
         msg += "⚠️ <i>Not financial advice. Always DYOR before buying.</i>";
