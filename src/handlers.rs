@@ -1,7 +1,7 @@
 use crate::crypto::{hash_pin, Crypto};
 use crate::db::Db;
 use crate::dexscreener;
-use crate::jupiter::{out_amount, Jupiter, SOL_MINT};
+use crate::jupiter::{out_amount, price_impact_pct, Jupiter, SOL_MINT};
 use crate::keyboards as kb;
 use crate::rpc::SolanaRpc;
 use crate::state::{Awaiting, Position, UserRecord};
@@ -511,7 +511,7 @@ impl App {
             }
         };
 
-        if let Some(impact) = jupiter::price_impact_pct(&quote) {
+        if let Some(impact) = price_impact_pct(&quote) {
             if impact > 3.0 {
                 self.tg.send_html(chat_id, &format!(
                     "⚠️ <b>High Price Impact: {impact:.2}%</b>\n\nThis trade will move the price significantly due to low liquidity. You may receive much less than expected.\n\nExecuting anyway..."
