@@ -12,6 +12,8 @@ pub enum Awaiting {
     EnteringWithdrawPin, // legacy placeholder, unused directly
     EnteringRugScanCA,
     EnteringImportKey,
+    VerifyingPinForChangePin,
+    VerifyingPinForImport,
 }
 
 impl Default for Awaiting {

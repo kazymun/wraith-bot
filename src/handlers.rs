@@ -202,6 +202,29 @@ impl App {
                 self.handle_rug_scan(chat_id, &text).await?;
             }
 
+            Awaiting::VerifyingPinForChangePin => {
+                if check_pin(&user, &text) {
+                    user.awaiting = Awaiting::SettingPin;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "✅ PIN confirmed. Enter your <b>new</b> 4-digit PIN:", None).await?;
+                } else {
+                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                }
+            }
+
+            Awaiting::VerifyingPinForImport => {
+                if check_pin(&user, &text) {
+                    user.awaiting = Awaiting::EnteringImportKey;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id,
+                        "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
+                        Some(kb::cancel_to("wallet")),
+                    ).await?;
+                } else {
+                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                }
+            }
+
             _ => {}
         }
 
@@ -376,12 +399,18 @@ impl App {
                 }
             }
             "import_wallet" => {
-                user.awaiting = Awaiting::EnteringImportKey;
-                self.db.save_user(&user)?;
-                self.tg.send_html(chat_id,
-                    "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
-                    Some(kb::cancel_to("wallet")),
-                ).await?;
+                if user.pin_hash.is_some() {
+                    user.awaiting = Awaiting::VerifyingPinForImport;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "🔑 Enter your PIN to import a wallet:", Some(kb::cancel_to("wallet"))).await?;
+                } else {
+                    user.awaiting = Awaiting::EnteringImportKey;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id,
+                        "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
+                        Some(kb::cancel_to("wallet")),
+                    ).await?;
+                }
             }
             "ai_tools" => {
                 self.tg.send_html(chat_id, "🤖 <b>AI Tools</b>", Some(kb::ai_tools_menu())).await?;
@@ -398,9 +427,15 @@ impl App {
                 self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu())).await?;
             }
             "change_pin" => {
-                user.awaiting = Awaiting::SettingPin;
-                self.db.save_user(&user)?;
-                self.tg.send_html(chat_id, "🔑 Enter your new 4-digit PIN:", None).await?;
+                if user.pin_hash.is_some() {
+                    user.awaiting = Awaiting::VerifyingPinForChangePin;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "🔑 Enter your <b>current</b> PIN to continue:", None).await?;
+                } else {
+                    user.awaiting = Awaiting::SettingPin;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "🔑 Enter your new 4-digit PIN:", None).await?;
+                }
             }
             "slippage" => {
                 self.tg.send_html(chat_id, &format!("📊 Current slippage: {:.1}%\n\nSelect:", user.slippage_bps as f64 / 100.0), Some(kb::slippage_menu())).await?;
@@ -544,6 +579,12 @@ impl App {
             Ok(sig) => {
                 let est_out_sol = out_amount(&quote).unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 let human_amount = raw_balance as f64 / 10f64.powi(decimals as i32);
+
+                // Remove position from tracking
+                let mut updated_user = self.db.get_user(user.telegram_id)?.unwrap_or_else(|| user.clone());
+                updated_user.positions.retain(|p| p.mint != ca);
+                self.db.save_user(&updated_user)?;
+
                 self.tg.send_html(chat_id, &format!(
                     "✅ <b>Sell sent</b>\n\n🪙 Sold: ~{human_amount:.4} tokens\n💰 Est. received: {est_out_sol:.4} SOL\n🔗 Tx: <code>{sig}</code>"
                 ), Some(kb::main_only())).await?;
