@@ -5,7 +5,8 @@ pub fn main_menu() -> Keyboard {
         vec![btn("💰 Wallet", "wallet"), btn("📊 Positions", "positions")],
         vec![btn("🟢 Buy", "buy"), btn("🔴 Sell", "sell")],
         vec![btn("🤖 AI Tools", "ai_tools"), btn("👥 Referral", "referral")],
-        vec![btn("⚙️ Settings", "settings"), btn("🔄 Refresh", "refresh")],
+        vec![btn("📈 PnL", "pnl"), btn("⚙️ Settings", "settings")],
+        vec![btn("🔄 Refresh", "refresh")],
     ]
 }
 
@@ -27,6 +28,7 @@ pub fn buy_amounts(ca: &str) -> Keyboard {
         vec![
             btn("5 SOL", &format!("buyamt_{ca}_5")),
             btn("10 SOL", &format!("buyamt_{ca}_10")),
+            btn("✏️ X SOL", &format!("buyamt_{ca}_custom")),
         ],
         vec![btn("❌ Cancel", "main")],
     ]
@@ -66,6 +68,7 @@ pub fn ai_tools_menu() -> Keyboard {
     vec![
         vec![btn("🔍 Rug Scanner", "rug_scan")],
         vec![btn("📊 Live Signals", "trade_signals")],
+        vec![btn("💎 AI Gem Scanner", "gem_scan")],
         vec![btn("🏠 Main Menu", "main")],
     ]
 }

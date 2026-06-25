@@ -202,6 +202,20 @@ impl App {
                 self.handle_rug_scan(chat_id, &text).await?;
             }
 
+            Awaiting::EnteringCustomBuyAmount { ca } => {
+                user.awaiting = Awaiting::None;
+                self.db.save_user(&user)?;
+                match text.parse::<f64>() {
+                    Ok(amount) if amount > 0.0 => {
+                        let data = format!("buyamt_{ca}_{amount}");
+                        self.handle_buy_amount(chat_id, telegram_id, &data).await?;
+                    }
+                    _ => {
+                        self.tg.send_html(chat_id, "❌ Invalid amount. Please enter a number like <code>0.25</code>", Some(kb::main_only())).await?;
+                    }
+                }
+            }
+
             Awaiting::VerifyingPinForChangePin => {
                 if check_pin(&user, &text) {
                     user.awaiting = Awaiting::SettingPin;
@@ -277,6 +291,9 @@ impl App {
                 let user = self.get_or_create_user(telegram_id)?;
                 let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 self.tg.send_html(chat_id, &format!("💰 <b>Balance:</b> {balance_sol:.4} SOL\n👛 <code>{}</code>", user.pubkey), None).await?;
+            }
+            "/pnl" => {
+                self.handle_pnl(chat_id, telegram_id).await?;
             }
             _ => {}
         }
@@ -423,6 +440,12 @@ impl App {
             "trade_signals" => {
                 self.handle_trade_signals(chat_id).await?;
             }
+            "pnl" => {
+                self.handle_pnl(chat_id, telegram_id).await?;
+            }
+            "gem_scan" => {
+                self.handle_gem_scan(chat_id).await?;
+            }
             "settings" => {
                 self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu())).await?;
             }
@@ -444,7 +467,15 @@ impl App {
                 self.tg.send_html(chat_id, "👥 <b>Referral Program</b>\n\nComing soon.", Some(kb::main_only())).await?;
             }
             other if other.starts_with("buyamt_") => {
-                self.handle_buy_amount(chat_id, telegram_id, other).await?;
+                // Check if user selected custom amount
+                if other.ends_with("_custom") {
+                    let ca = other.trim_start_matches("buyamt_").trim_end_matches("_custom");
+                    user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "✏️ Enter the amount of SOL you want to spend (e.g. <code>0.25</code>):", Some(kb::cancel_to("main"))).await?;
+                } else {
+                    self.handle_buy_amount(chat_id, telegram_id, other).await?;
+                }
             }
             other if other.starts_with("slip_") => {
                 if let Ok(bps) = other.trim_start_matches("slip_").parse::<u32>() {
@@ -677,6 +708,163 @@ impl App {
             "🤖 <b>AI Rug Analysis</b>\n\n<b>Risk Score: {}/100</b>\n<code>[{bar}]</code>\n{} <b>{}</b>\n\n{flags}{good}",
             a.score, a.risk_emoji, a.risk_level
         ), Some(kb::main_only())).await?;
+        Ok(())
+    }
+
+    async fn handle_pnl(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
+        let user = self.get_or_create_user(telegram_id)?;
+        if user.positions.is_empty() {
+            self.tg.send_html(chat_id, "📈 <b>PnL Summary</b>\n\nNo positions tracked yet. Buy a token first!", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+
+        self.tg.send_html(chat_id, "📈 Calculating PnL...", None).await?;
+
+        let sol_price_usd = dexscreener::get_token_pair(SOL_MINT)
+            .await.ok().flatten()
+            .and_then(|p| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()))
+            .unwrap_or(0.0);
+
+        let mut set = tokio::task::JoinSet::new();
+        for (i, p) in user.positions.iter().enumerate() {
+            let mint = p.mint.clone();
+            set.spawn(async move {
+                let price = dexscreener::get_token_pair(&mint)
+                    .await.ok().flatten()
+                    .and_then(|pair| pair["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()));
+                (i, price)
+            });
+        }
+        let mut prices: Vec<Option<f64>> = vec![None; user.positions.len()];
+        while let Some(res) = set.join_next().await {
+            if let Ok((i, price)) = res { prices[i] = price; }
+        }
+
+        let mut total_invested_sol = 0.0f64;
+        let mut total_current_usd = 0.0f64;
+        let mut total_invested_usd = 0.0f64;
+        let mut msg = "📈 <b>PnL Summary</b>\n\n".to_string();
+
+        for (i, p) in user.positions.iter().enumerate() {
+            total_invested_sol += p.sol_spent;
+            match prices[i] {
+                Some(cur) if p.entry_price_usd > 0.0 => {
+                    let pct = (cur / p.entry_price_usd - 1.0) * 100.0;
+                    let entry_val = p.tokens_received_est * p.entry_price_usd;
+                    let cur_val = p.tokens_received_est * cur;
+                    let pl_usd = cur_val - entry_val;
+                    let pl_sol = if sol_price_usd > 0.0 { pl_usd / sol_price_usd } else { 0.0 };
+                    total_invested_usd += entry_val;
+                    total_current_usd += cur_val;
+                    let arrow = if pct >= 0.0 { "🟢" } else { "🔴" };
+                    msg += &format!("{arrow} <b>{}</b> {pct:+.1}% | P/L: {pl_sol:+.4} SOL (${pl_usd:+.2})\n", p.symbol);
+                }
+                _ => {
+                    msg += &format!("⚪ <b>{}</b> — price unavailable\n", p.symbol);
+                }
+            }
+        }
+
+        let total_pl_usd = total_current_usd - total_invested_usd;
+        let total_pl_sol = if sol_price_usd > 0.0 { total_pl_usd / sol_price_usd } else { 0.0 };
+        let total_pct = if total_invested_usd > 0.0 { (total_current_usd / total_invested_usd - 1.0) * 100.0 } else { 0.0 };
+
+        msg += &format!(
+            "\n━━━━━━━━━━━━━━\n💼 <b>Total invested:</b> {total_invested_sol:.4} SOL\n📊 <b>Overall P/L:</b> {total_pl_sol:+.4} SOL (${total_pl_usd:+.2}) {total_pct:+.1}%"
+        );
+
+        self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
+        Ok(())
+    }
+
+    async fn handle_gem_scan(&self, chat_id: i64) -> Result<()> {
+        self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nScanning Solana for high-potential tokens...", None).await?;
+
+        let pairs = dexscreener::get_trending_solana_pairs().await.unwrap_or_default();
+        if pairs.is_empty() {
+            self.tg.send_html(chat_id, "❌ Couldn't fetch market data. Try again.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+
+        // Filter using real gem criteria
+        let mut gems: Vec<(&serde_json::Value, i32, String)> = vec![];
+
+        for pair in &pairs {
+            let mc = pair["fdv"].as_f64().unwrap_or(0.0);
+            let liq = pair["liquidity"]["usd"].as_f64().unwrap_or(0.0);
+            let vol24h = pair["volume"]["h24"].as_f64().unwrap_or(0.0);
+            let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
+            let buys = pair["txns"]["h24"]["buys"].as_i64().unwrap_or(0);
+            let sells = pair["txns"]["h24"]["sells"].as_i64().unwrap_or(0);
+
+            // Skip obvious rugs and too-big tokens
+            if mc <= 0.0 || liq < 5_000.0 || mc > 500_000_000.0 { continue; }
+
+            let mut score = 0i32;
+            let mut narrative = String::new();
+
+            // Sweet spot MC: $50K–$50M
+            if mc >= 50_000.0 && mc <= 50_000_000.0 { score += 25; }
+            else if mc < 50_000.0 { score += 15; } // ultra early, risky
+
+            // Healthy liq/MC ratio
+            if liq / mc > 0.05 { score += 20; narrative += "Strong liquidity. "; }
+            else if liq / mc > 0.02 { score += 10; }
+
+            // Buy pressure
+            if buys > sells * 2 { score += 20; narrative += "Heavy buy pressure. "; }
+            else if buys > sells { score += 10; }
+
+            // Volume relative to MC
+            let vol_ratio = if mc > 0.0 { vol24h / mc } else { 0.0 };
+            if vol_ratio > 0.1 { score += 15; narrative += "High volume activity. "; }
+            else if vol_ratio > 0.05 { score += 8; }
+
+            // Momentum
+            if change1h > 5.0 && change1h < 80.0 { score += 10; narrative += "Healthy momentum. "; }
+            else if change1h > 80.0 { score -= 5; narrative += "Possibly over-extended. "; }
+
+            // DEX quality
+            if let Some(dex) = pair["dexId"].as_str() {
+                if matches!(dex, "raydium" | "orca" | "meteora") { score += 10; }
+            }
+
+            if score >= 40 {
+                if narrative.is_empty() { narrative = "Early stage with moderate signals.".to_string(); }
+                gems.push((pair, score, narrative));
+            }
+        }
+
+        if gems.is_empty() {
+            self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nNo standout gems found in current market data. Try again in a few minutes for fresh signals.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+
+        // Sort by score
+        gems.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut msg = "💎 <b>AI Gem Scanner — Top Picks</b>\n\n".to_string();
+        for (pair, score, narrative) in gems.iter().take(5) {
+            let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
+            let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
+            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
+            let mc = pair["fdv"].as_f64().map(|v| {
+                if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
+                else { format!("${:.0}K", v / 1_000.0) }
+            }).unwrap_or_else(|| "N/A".to_string());
+            let liq = pair["liquidity"]["usd"].as_f64().map(|v| format!("${:.0}K", v / 1_000.0)).unwrap_or_else(|| "N/A".to_string());
+            let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
+            let upside = if *score >= 70 { "🚀 High (5–20x potential)" }
+                else if *score >= 55 { "⚡ Moderate (2–5x potential)" }
+                else { "👀 Speculative (DYOR)" };
+
+            msg += &format!(
+                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n📖 <i>{narrative}</i>\n🎯 Upside: {upside}\n\n"
+            );
+        }
+        msg += "⚠️ <i>Not financial advice. Always DYOR before buying.</i>";
+
+        self.tg.send_html(chat_id, &msg, Some(kb::ai_tools_menu())).await?;
         Ok(())
     }
 

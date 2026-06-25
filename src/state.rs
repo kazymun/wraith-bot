@@ -14,6 +14,7 @@ pub enum Awaiting {
     EnteringImportKey,
     VerifyingPinForChangePin,
     VerifyingPinForImport,
+    EnteringCustomBuyAmount { ca: String },
 }
 
 impl Default for Awaiting {
