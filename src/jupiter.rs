@@ -3,6 +3,7 @@ use serde_json::Value;
 
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+#[derive(Clone)]
 pub struct Jupiter {
     http: reqwest::Client,
 }

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+#[derive(Clone)]
 pub struct SolanaRpc {
     url: String,
     http: reqwest::Client,

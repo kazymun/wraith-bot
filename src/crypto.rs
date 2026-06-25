@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
 use rand::RngCore;
 
+#[derive(Clone)]
 pub struct Crypto {
     cipher: Aes256Gcm,
 }
