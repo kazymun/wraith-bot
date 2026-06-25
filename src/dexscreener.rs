@@ -3,29 +3,28 @@ use serde_json::Value;
 
 pub async fn get_token_pair(ca: &str) -> Result<Option<Value>> {
     let url = format!("https://api.dexscreener.com/latest/dex/tokens/{ca}");
-    let resp: Value = reqwest::get(url).await?.json().await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+    let resp: Value = client.get(url).send().await?.json().await?;
     Ok(resp["pairs"].as_array().and_then(|p| p.first()).cloned())
 }
 
 pub async fn get_trending_solana_pairs() -> Result<Vec<Value>> {
-    let url = "https://api.dexscreener.com/token-boosts/top/v1";
-    let resp: Value = reqwest::get(url).await?.json().await?;
-
-    // Token boosts returns an array directly
-    let boosted: Vec<Value> = resp.as_array().cloned().unwrap_or_default();
-
-    // Filter to Solana only, then fetch pair data for each
-    let mut pairs = vec![];
-    for item in boosted.into_iter().take(12) {
-        if item["chainId"].as_str() != Some("solana") { continue; }
-        if let Some(addr) = item["tokenAddress"].as_str() {
-            if let Ok(Some(pair)) = get_token_pair(addr).await {
-                pairs.push(pair);
-            }
-        }
-        if pairs.len() >= 6 { break; }
-    }
-    Ok(pairs)
+    // Use search endpoint for trending Solana tokens — much faster
+    let url = "https://api.dexscreener.com/latest/dex/search?q=solana";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let resp: Value = client.get(url).send().await?.json().await?;
+    Ok(resp["pairs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p["chainId"].as_str() == Some("solana"))
+        .take(10)
+        .collect())
 }
 
 pub struct Analysis {
