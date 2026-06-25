@@ -500,7 +500,7 @@ impl App {
             return Ok(());
         }
 
-        self.tg.send_html(chat_id, "⚡ Getting quote and executing...", None).await?;
+        self.tg.send_html(chat_id, "⚡ Getting quote...", None).await?;
 
         let lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
         let quote = match self.jup.get_quote(SOL_MINT, ca, lamports, user.slippage_bps).await {
@@ -510,6 +510,16 @@ impl App {
                 return Ok(());
             }
         };
+
+        if let Some(impact) = jupiter::price_impact_pct(&quote) {
+            if impact > 3.0 {
+                self.tg.send_html(chat_id, &format!(
+                    "⚠️ <b>High Price Impact: {impact:.2}%</b>\n\nThis trade will move the price significantly due to low liquidity. You may receive much less than expected.\n\nExecuting anyway..."
+                ), None).await?;
+            }
+        }
+
+        self.tg.send_html(chat_id, "⚡ Executing swap...", None).await?;
 
         match self.sign_and_send_swap(&user, &quote).await {
             Ok(sig) => {
