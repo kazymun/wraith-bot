@@ -723,42 +723,10 @@ impl App {
         Ok(())
     }
 
-    async fn ai_gem_narrative(&self, name: &str, symbol: &str, mc: &str, liq: &str, change1h: f64, score: i32) -> String {
-        let prompt = format!(
-            "You are a crypto analyst specializing in Solana memecoins and narrative trading.\n\nAnalyze this token and respond in exactly this format (no extra text):\nNARRATIVE: [one of: AI, Meme, DePIN, Gaming, RWA, DeFi, Infrastructure, Animal, Political, Pop Culture, Unknown]\nDESCRIPTION: [1 sentence max — what is this token about]\nWHY NOW: [1 sentence — why could this pump right now]\nRISK: [1 sentence — main risk]\nUPSIDE: [X-Y]x\n\nToken: {name} (${symbol})\nMarket Cap: {mc}\nLiquidity: {liq}\n1h Change: {change1h:.1}%\nSafety Score: {score}/100"
-        );
-
-        let body = serde_json::json!({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 200,
-            "messages": [{ "role": "user", "content": prompt }]
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) => {
-                if let Ok(v) = r.json::<serde_json::Value>().await {
-                    v["content"][0]["text"].as_str().unwrap_or("").to_string()
-                } else {
-                    String::new()
-                }
-            }
-            Err(_) => String::new(),
-        }
-    }
-
     pub async fn run_gem_scanner(&self) {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await; // scan every 5 mins
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
             let pairs = match dexscreener::get_trending_solana_pairs().await {
                 Ok(p) => p,
@@ -773,10 +741,10 @@ impl App {
                 if seen.contains(&ca) { continue; }
 
                 let a = dexscreener::analyze(pair);
-                if a.score < 65 { continue; } // only high-confidence gems
+                if a.score < 65 { continue; }
 
                 seen.insert(ca.clone());
-                if seen.len() > 500 { seen.clear(); } // prevent memory bloat
+                if seen.len() > 500 { seen.clear(); }
 
                 let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
                 let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
@@ -790,16 +758,8 @@ impl App {
                 let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
                 let upside = if a.score >= 80 { "🚀 High potential" } else { "⚡ Moderate potential" };
 
-                // Generate AI narrative
-                let narrative = self.ai_gem_narrative(name, symbol, &mc, &liq, change1h, a.score).await;
-                let narrative_section = if !narrative.is_empty() {
-                    format!("\n\n📖 <b>AI Analysis:</b>\n<i>{narrative}</i>")
-                } else {
-                    String::new()
-                };
-
                 let msg = format!(
-                    "💎 <b>Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100\n🎯 {upside}{narrative_section}\n\n<i>Tap buy to trade instantly 👇</i>",
+                    "💎 <b>Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100\n🎯 {upside}\n\n<i>Tap buy to trade instantly 👇</i>",
                     a.score
                 );
                 let kb = vec![
@@ -807,7 +767,6 @@ impl App {
                     vec![crate::telegram::btn("❌ Skip", "main")],
                 ];
 
-                // Send to all users with gem_alerts enabled
                 for item in self.db.inner_iter() {
                     if let Ok((_, bytes)) = item {
                         if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
