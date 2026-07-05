@@ -72,9 +72,14 @@ async fn main() -> anyhow::Result<()> {
             offset = update.update_id + 1;
 
             if let Some(msg) = update.message {
-                if let Err(e) = app.handle_message(msg).await {
-                    eprintln!("Error handling message: {e}");
-                }
+              if let Err(e) = app.handle_message(msg).await {
+    eprintln!("Error handling message: {e}");
+    let _ = app.tg.send_html(
+        chat_id,
+        "⚠️ Something went wrong loading your account. This has been logged — please try again in a moment.",
+        None,
+    ).await;
+}
             } else if let Some(cb) = update.callback_query {
                 let chat_id = cb.message.as_ref().map(|m| m.chat.id);
                 let message_id = cb.message.as_ref().map(|m| m.message_id);

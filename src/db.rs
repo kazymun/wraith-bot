@@ -1,5 +1,6 @@
-use crate::state::UserRecord;
-use anyhow::Result;
+use crate::crypto::EnvelopeSecret;
+use crate::state::{Awaiting, PinLockout, Position, UserRecord};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 /// Per-token record for the gem scanner: what we saw last scan, plus
@@ -45,11 +46,97 @@ impl Db {
         format!("user:{telegram_id}")
     }
 
+    /// IMPORTANT: this must NEVER return `Ok(None)` for a record that
+    /// exists on disk but failed to parse. Callers (see
+    /// `App::get_or_create_user`) treat `Ok(None)` as "brand new user"
+    /// and will generate a FRESH WALLET -- if a parse failure were
+    /// mistaken for "no user", the old wallet (and any funds in it)
+    /// would be silently orphaned. So: key not found -> Ok(None). Key
+    /// found but unparseable -> attempt recovery; if recovery itself
+    /// fails, return Err (bot stays broken for that user rather than
+    /// ever inventing a new wallet for them).
     pub fn get_user(&self, telegram_id: i64) -> Result<Option<UserRecord>> {
         match self.inner.get(Self::key(telegram_id))? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(bytes) => match serde_json::from_slice::<UserRecord>(&bytes) {
+                Ok(user) => Ok(Some(user)),
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ User {telegram_id}: record failed to parse ({e}). \
+                         Attempting recovery (wallet/secret preserved, in-flight UI state reset)..."
+                    );
+                    match Self::recover_user_record(telegram_id, &bytes) {
+                        Some(recovered) => {
+                            eprintln!("✅ User {telegram_id}: recovered successfully.");
+                            self.save_user(&recovered)?;
+                            Ok(Some(recovered))
+                        }
+                        None => {
+                            eprintln!(
+                                "🚨 User {telegram_id}: recovery FAILED -- pubkey/secret unreadable. \
+                                 Record left untouched on disk. Needs manual inspection."
+                            );
+                            Err(anyhow!("corrupted user record for {telegram_id}: {e}"))
+                        }
+                    }
+                }
+            },
             None => Ok(None),
         }
+    }
+
+    /// Rebuilds a UserRecord field-by-field from raw JSON, tolerating any
+    /// field that has changed shape or gone missing -- EXCEPT `pubkey` and
+    /// `secret`, which are the only two fields that actually matter for
+    /// "does this user still own their wallet". If either of those can't
+    /// be read, we refuse to recover (better to stay broken than guess).
+    /// Everything else (awaiting/settings/positions/etc) falls back to a
+    /// safe default if it can't be parsed -- losing "what were we waiting
+    /// for the user to type next" is annoying, never fund-affecting.
+    fn recover_user_record(telegram_id: i64, bytes: &[u8]) -> Option<UserRecord> {
+        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+
+        let pubkey = v.get("pubkey")?.as_str()?.to_string();
+        let secret: EnvelopeSecret = serde_json::from_value(v.get("secret")?.clone()).ok()?;
+
+        let pin_lockout: PinLockout = v
+            .get("pin_lockout")
+            .and_then(|x| serde_json::from_value(x.clone()).ok())
+            .unwrap_or_default();
+        let slippage_bps = v.get("slippage_bps").and_then(|x| x.as_u64()).unwrap_or(500) as u32;
+        let positions: Vec<Position> = v
+            .get("positions")
+            .and_then(|x| serde_json::from_value(x.clone()).ok())
+            .unwrap_or_default();
+        let ref_code = v
+            .get("ref_code")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("WRAITH_{}", telegram_id % 1_000_000));
+        let refs = v.get("refs").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let created_at = v
+            .get("created_at")
+            .and_then(|x| x.as_i64())
+            .unwrap_or_else(crate::state::chrono_now);
+        let gem_alerts = v.get("gem_alerts").and_then(|x| x.as_bool()).unwrap_or(true);
+        let known_withdraw_addresses: Vec<String> = v
+            .get("known_withdraw_addresses")
+            .and_then(|x| serde_json::from_value(x.clone()).ok())
+            .unwrap_or_default();
+
+        Some(UserRecord {
+            telegram_id,
+            pubkey,
+            secret,
+            pin_lockout,
+            awaiting: Awaiting::None, // transient UI state only -- always safe to reset
+            slippage_bps,
+            positions,
+            ref_code,
+            refs,
+            created_at,
+            gem_alerts,
+            known_withdraw_addresses,
+        })
     }
 
     pub fn save_user(&self, user: &UserRecord) -> Result<()> {
