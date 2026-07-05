@@ -850,15 +850,22 @@ impl App {
         match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
             Ok(sig) => {
                 let est_out_raw = out_amount(&quote).unwrap_or(0);
-                let symbol = ca.chars().take(6).collect::<String>().to_uppercase();
 
                 let decimals = self.rpc.get_mint_decimals(ca).await.unwrap_or(9);
-                let entry_price_usd = dexscreener::get_token_pair(ca)
-                    .await
-                    .ok()
-                    .flatten()
+                let pair = dexscreener::get_token_pair(ca).await.ok().flatten();
+                let entry_price_usd = pair
+                    .as_ref()
                     .and_then(|p| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()))
                     .unwrap_or(0.0);
+                // Real ticker from DexScreener when available (e.g. "BONK");
+                // falls back to the old truncated-CA display only if the
+                // token has no DexScreener listing yet (very fresh launches).
+                let symbol = pair
+                    .as_ref()
+                    .and_then(|p| p["baseToken"]["symbol"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| crate::telegram::escape_html(s))
+                    .unwrap_or_else(|| ca.chars().take(6).collect::<String>().to_uppercase());
 
                 let human_tokens = est_out_raw as f64 / 10f64.powi(decimals as i32);
                 let spent_usd_est = if entry_price_usd > 0.0 { human_tokens * entry_price_usd } else { 0.0 };
