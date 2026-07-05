@@ -1,18 +1,44 @@
-use crate::crypto::{hash_pin, Crypto};
+use crate::crypto::Crypto;
 use crate::db::Db;
 use crate::dexscreener;
 use crate::jupiter::{out_amount, price_impact_pct, Jupiter, SOL_MINT};
 use crate::keyboards as kb;
+use crate::pumpportal::PumpEvent;
 use crate::rpc::SolanaRpc;
 use crate::state::{Awaiting, Position, UserRecord};
 use crate::telegram::{TgClient, TgMessage};
 use crate::wallet;
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::system_instruction;
 use solana_sdk::transaction::{Transaction, VersionedTransaction};
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use zeroize::Zeroize;
+
+const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+const TRADING_SESSION_SECS: i64 = 15 * 60;
+/// Same rough migration threshold as pumpportal.rs, used only for the
+/// human-readable "~X% toward migration" display in watch alerts.
+const MIGRATION_SOL_APPROX_FOR_DISPLAY: f64 = 85.0;
+
+/// In-memory-only cache of a decrypted keypair, so a user who already
+/// entered their PIN once doesn't get asked again on every single trade.
+/// NEVER written to disk, wiped on process restart, and zeroized on drop.
+/// Export and withdraw NEVER consult this cache -- they always require a
+/// fresh PIN, no matter how recently the user unlocked trading.
+struct TradingSession {
+    keypair_bytes: [u8; 64],
+    expires_at: i64,
+}
+
+impl Drop for TradingSession {
+    fn drop(&mut self) {
+        self.keypair_bytes.zeroize();
+    }
+}
 
 #[derive(Clone)]
 pub struct App {
@@ -23,17 +49,111 @@ pub struct App {
     pub jup: Jupiter,
     pub default_slippage_bps: u32,
     pub fee_wallet: String,
+    pub min_pin_length: usize,
+    sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
-const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-
 impl App {
+    pub fn new(
+        tg: TgClient,
+        db: Db,
+        crypto: Crypto,
+        rpc: SolanaRpc,
+        jup: Jupiter,
+        default_slippage_bps: u32,
+        fee_wallet: String,
+        min_pin_length: usize,
+    ) -> Self {
+        Self {
+            tg,
+            db,
+            crypto,
+            rpc,
+            jup,
+            default_slippage_bps,
+            fee_wallet,
+            min_pin_length,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    // ---------- trading session cache ----------
+
+    fn session_keypair(&self, telegram_id: i64) -> Option<Keypair> {
+        let now = crate::state::chrono_now();
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(&telegram_id) {
+            Some(s) if s.expires_at > now => Keypair::from_bytes(&s.keypair_bytes).ok(),
+            Some(_) => {
+                sessions.remove(&telegram_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn store_session(&self, telegram_id: i64, keypair: &Keypair) {
+        let now = crate::state::chrono_now();
+        self.sessions.lock().unwrap().insert(
+            telegram_id,
+            TradingSession {
+                keypair_bytes: keypair.to_bytes(),
+                expires_at: now + TRADING_SESSION_SECS,
+            },
+        );
+    }
+
+    fn clear_session(&self, telegram_id: i64) {
+        self.sessions.lock().unwrap().remove(&telegram_id);
+    }
+
+    /// Enforces lockout BEFORE ever calling into crypto (the crypto call
+    /// itself is a brute-force oracle -- see crypto.rs), then attempts to
+    /// decrypt. Always persists the updated lockout counters, win or lose.
+    fn try_pin(&self, user: &mut UserRecord, pin: &str) -> Result<Option<Keypair>> {
+        let now = crate::state::chrono_now();
+        if user.pin_lockout.seconds_remaining(now) > 0 {
+            return Ok(None);
+        }
+        match wallet::load_keypair(&self.crypto, pin, user) {
+            Ok(kp) => {
+                user.pin_lockout.record_success();
+                self.db.save_user(user)?;
+                Ok(Some(kp))
+            }
+            Err(_) => {
+                user.pin_lockout.record_failure(now);
+                self.db.save_user(user)?;
+                Ok(None)
+            }
+        }
+    }
+
+    // ---------- user bootstrap ----------
+
+    /// PIN is mandatory before a wallet's secret can be encrypted, so a
+    /// brand new user gets a REAL wallet + pubkey immediately (so we can
+    /// show a deposit address), but the private key sits briefly as
+    /// plaintext inside `Awaiting::SettingPin` -- not decryptable, not
+    /// used for anything -- until their very first reply (their chosen
+    /// PIN) replaces the placeholder `secret` with a real encrypted one.
     pub fn get_or_create_user(&self, telegram_id: i64) -> Result<UserRecord> {
         if let Some(u) = self.db.get_user(telegram_id)? {
             return Ok(u);
         }
-        let (pubkey, nonce, cipher) = wallet::generate_encrypted_wallet(&self.crypto)?;
-        let user = UserRecord::new(telegram_id, pubkey, nonce, cipher, self.default_slippage_bps);
+        let wallet = wallet::create_wallet();
+        let placeholder_secret = self
+            .crypto
+            .encrypt_with_pin("", wallet.private_key_base58.as_bytes())?;
+        let mut user = UserRecord::new(
+            telegram_id,
+            wallet.address.clone(),
+            placeholder_secret,
+            self.default_slippage_bps,
+        );
+        user.awaiting = Awaiting::SettingPin {
+            pending_wallet_secret_plain_b58: wallet.private_key_base58.clone(),
+        };
         self.db.save_user(&user)?;
         Ok(user)
     }
@@ -69,6 +189,8 @@ impl App {
         Ok(())
     }
 
+    // ---------- message dispatch ----------
+
     pub async fn handle_message(&self, msg: TgMessage) -> Result<()> {
         let chat_id = msg.chat.id;
         let telegram_id = match &msg.from {
@@ -87,75 +209,181 @@ impl App {
         let mut user = self.get_or_create_user(telegram_id)?;
 
         match user.awaiting.clone() {
-            Awaiting::SettingPin => {
-                if text.len() == 4 && text.chars().all(|c| c.is_ascii_digit()) {
-                    user.pin_hash = Some(hash_pin(&text));
-                    user.awaiting = Awaiting::None;
-                    self.db.save_user(&user)?;
+            Awaiting::SettingPin { pending_wallet_secret_plain_b58 } => {
+                if text.len() < self.min_pin_length || !text.chars().all(|c| c.is_ascii_digit()) {
                     self.tg
-                        .send_html(chat_id, "✅ <b>PIN set!</b> This will be required to export your key or withdraw funds.", None)
+                        .send_html(
+                            chat_id,
+                            &format!("❌ PIN must be at least {} digits, numbers only. Try again:", self.min_pin_length),
+                            None,
+                        )
                         .await?;
-                    self.show_main(chat_id, telegram_id).await?;
-                } else {
-                    self.tg.send_html(chat_id, "❌ PIN must be exactly 4 digits. Try again:", None).await?;
+                    return Ok(());
                 }
+                let mut plaintext = pending_wallet_secret_plain_b58;
+                let secret = self.crypto.encrypt_with_pin(&text, plaintext.as_bytes())?;
+                plaintext.zeroize();
+                user.secret = secret;
+                user.awaiting = Awaiting::None;
+                self.db.save_user(&user)?;
+                self.tg
+                    .send_html(chat_id, "✅ <b>PIN set!</b> Your wallet is now encrypted and ready to use.", None)
+                    .await?;
+                self.show_main(chat_id, telegram_id).await?;
             }
 
             Awaiting::VerifyingPinForExport => {
-                if check_pin(&user, &text) {
-                    user.awaiting = Awaiting::None;
-                    self.db.save_user(&user)?;
-                    match wallet::export_private_key_b58(&self.crypto, &user) {
-                        Ok(key) => {
-                            let sent = self.tg.send_html(chat_id,
-                                &format!(
-                                    "🔑 <b>Export Private Key</b>\n\n⚠️ <b>WARNING: Never share this with anyone!</b>\nAnyone with this key has full control of your wallet.\n\n<code>{key}</code>\n\nImport this into Phantom, Solflare or any Solana wallet. This message self-deletes in 60s — tap below to remove it sooner.",
-                                ),
-                                Some(kb::export_key_keyboard()),
-                            ).await?;
-                            if let Some(mid) = sent {
-                                let tg = self.tg.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                                    let _ = tg.delete_message(chat_id, mid).await;
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            self.tg.send_html(chat_id, &format!("❌ Couldn't decrypt your key: {e}"), Some(kb::main_only())).await?;
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        let key = bs58::encode(kp.to_bytes()).into_string();
+                        let sent = self.tg.send_html(chat_id,
+                            &format!(
+                                "🔑 <b>Export Private Key</b>\n\n⚠️ <b>WARNING: Never share this with anyone!</b>\nAnyone with this key has full control of your wallet.\n\n<code>{key}</code>\n\nImport this into Phantom, Solflare or any Solana wallet. This message self-deletes in 60s — tap below to remove it sooner.",
+                            ),
+                            Some(kb::export_key_keyboard()),
+                        ).await?;
+                        if let Some(mid) = sent {
+                            let tg = self.tg.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                let _ = tg.delete_message(chat_id, mid).await;
+                            });
                         }
                     }
-                } else {
-                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
                 }
             }
 
             Awaiting::VerifyingPinForWithdraw { dest, amount_sol } => {
-                if check_pin(&user, &text) {
-                    user.awaiting = Awaiting::None;
-                    self.db.save_user(&user)?;
-                    self.do_withdraw(chat_id, &user, &dest, amount_sol).await?;
-                } else {
-                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        let is_new = !user.known_withdraw_addresses.iter().any(|a| a == &dest);
+                        if is_new {
+                            user.known_withdraw_addresses.push(dest.clone());
+                        }
+                        self.db.save_user(&user)?;
+                        self.store_session(telegram_id, &kp);
+                        if is_new {
+                            self.tg
+                                .send_html(
+                                    chat_id,
+                                    "✅ PIN confirmed. This is a new withdrawal address, so sending in 30s as a safety window — message us if this wasn't you.",
+                                    None,
+                                )
+                                .await?;
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        }
+                        self.do_withdraw(chat_id, &kp, &dest, amount_sol).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
+                }
+            }
+
+            Awaiting::EnteringNewPin => {
+                if text.len() < self.min_pin_length || !text.chars().all(|c| c.is_ascii_digit()) {
+                    self.tg
+                        .send_html(
+                            chat_id,
+                            &format!("❌ PIN must be at least {} digits, numbers only. Try again:", self.min_pin_length),
+                            None,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                user.awaiting = Awaiting::VerifyingPinForChangePin { new_pin: text.clone() };
+                self.db.save_user(&user)?;
+                self.tg
+                    .send_html(chat_id, "✅ Got it. Now enter your <b>current</b> PIN to confirm the change:", None)
+                    .await?;
+            }
+
+            Awaiting::VerifyingPinForChangePin { new_pin } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                let now = crate::state::chrono_now();
+                match self.crypto.rewrap_with_new_pin(&text, &new_pin, &user.secret) {
+                    Ok(fresh) => {
+                        user.secret = fresh;
+                        user.pin_lockout.record_success();
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.clear_session(telegram_id);
+                        self.tg.send_html(chat_id, "✅ <b>PIN changed!</b>", Some(kb::main_only())).await?;
+                    }
+                    Err(_) => {
+                        user.pin_lockout.record_failure(now);
+                        self.db.save_user(&user)?;
+                        self.tg.send_html(chat_id, "❌ Wrong current PIN. Try again, or /cancel.", None).await?;
+                    }
                 }
             }
 
             Awaiting::EnteringImportKey => {
-                user.awaiting = Awaiting::None;
-                match wallet::import_encrypted_wallet(&self.crypto, &text) {
-                    Ok((pubkey, nonce, cipher)) => {
-                        user.pubkey = pubkey.clone();
-                        user.enc_nonce = nonce;
-                        user.enc_cipher = cipher;
+                match wallet::import_wallet(&text) {
+                    Ok(_) => {
+                        user.awaiting = Awaiting::VerifyingPinForImport { pending_key_b58: text.clone() };
                         self.db.save_user(&user)?;
-                        self.tg.send_html(chat_id,
-                            &format!("✅ <b>Wallet Imported!</b>\n\n📍 <b>Address:</b> <code>{pubkey}</code>"),
-                            Some(kb::wallet_menu()),
-                        ).await?;
+                        self.tg
+                            .send_html(chat_id, "🔑 Enter your PIN to confirm and encrypt this wallet:", Some(kb::cancel_to("wallet")))
+                            .await?;
                     }
                     Err(e) => {
+                        user.awaiting = Awaiting::None;
                         self.db.save_user(&user)?;
                         self.tg.send_html(chat_id, &format!("❌ {e}\n\nMake sure you're pasting a raw Solana private key (base58), not a seed phrase."), Some(kb::main_only())).await?;
+                    }
+                }
+            }
+
+            Awaiting::VerifyingPinForImport { pending_key_b58 } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                let now = crate::state::chrono_now();
+                match wallet::load_keypair(&self.crypto, &text, &user) {
+                    Ok(_) => {
+                        user.pin_lockout.record_success();
+                        match wallet::import_encrypted_wallet(&self.crypto, &text, &pending_key_b58) {
+                            Ok((pubkey, secret)) => {
+                                user.pubkey = pubkey.clone();
+                                user.secret = secret;
+                                user.positions.clear();
+                                user.awaiting = Awaiting::None;
+                                self.db.save_user(&user)?;
+                                self.clear_session(telegram_id);
+                                self.tg.send_html(chat_id,
+                                    &format!("✅ <b>Wallet Imported!</b>\n\n📍 <b>Address:</b> <code>{pubkey}</code>"),
+                                    Some(kb::wallet_menu()),
+                                ).await?;
+                            }
+                            Err(e) => {
+                                self.db.save_user(&user)?;
+                                self.tg.send_html(chat_id, &format!("❌ {e}"), Some(kb::main_only())).await?;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        user.pin_lockout.record_failure(now);
+                        self.db.save_user(&user)?;
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
                     }
                 }
             }
@@ -175,13 +403,15 @@ impl App {
                     return Ok(());
                 }
                 let amount_sol = (balance_sol - 0.0005).max(0.0); // leave a little for fees/rent
-                if user.pin_hash.is_some() {
-                    user.awaiting = Awaiting::VerifyingPinForWithdraw { dest, amount_sol };
-                    self.db.save_user(&user)?;
+                let is_known = user.known_withdraw_addresses.iter().any(|a| a == &dest);
+                user.awaiting = Awaiting::VerifyingPinForWithdraw { dest: dest.clone(), amount_sol };
+                self.db.save_user(&user)?;
+                if is_known {
                     self.tg.send_html(chat_id, &format!("⬆️ Withdrawing ~{amount_sol:.4} SOL.\n\nEnter your PIN to confirm:"), None).await?;
                 } else {
-                    self.db.save_user(&user)?;
-                    self.do_withdraw(chat_id, &user, &dest, amount_sol).await?;
+                    self.tg.send_html(chat_id, &format!(
+                        "⚠️ <b>New withdrawal address</b> — you haven't sent here before.\n\n⬆️ Withdrawing ~{amount_sol:.4} SOL to:\n<code>{dest}</code>\n\nEnter your PIN to confirm:"
+                    ), None).await?;
                 }
             }
 
@@ -194,7 +424,7 @@ impl App {
             Awaiting::EnteringSellCA => {
                 user.awaiting = Awaiting::None;
                 self.db.save_user(&user)?;
-                self.handle_sell_ca(chat_id, &user, &text).await?;
+                self.handle_sell_ca(chat_id, telegram_id, &text).await?;
             }
 
             Awaiting::EnteringRugScanCA => {
@@ -217,30 +447,43 @@ impl App {
                 }
             }
 
-            Awaiting::VerifyingPinForChangePin => {
-                if check_pin(&user, &text) {
-                    user.awaiting = Awaiting::SettingPin;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "✅ PIN confirmed. Enter your <b>new</b> 4-digit PIN:", None).await?;
-                } else {
-                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+            Awaiting::VerifyingPinForBuy { ca, amount_sol } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.store_session(telegram_id, &kp);
+                        self.execute_buy(chat_id, &mut user, &kp, &ca, amount_sol).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
                 }
             }
 
-            Awaiting::VerifyingPinForImport => {
-                if check_pin(&user, &text) {
-                    user.awaiting = Awaiting::EnteringImportKey;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id,
-                        "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
-                        Some(kb::cancel_to("wallet")),
-                    ).await?;
-                } else {
-                    self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+            Awaiting::VerifyingPinForSell { ca } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.store_session(telegram_id, &kp);
+                        self.execute_sell(chat_id, &mut user, &kp, &ca).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
                 }
             }
 
-            _ => {}
+            Awaiting::None => {}
         }
 
         Ok(())
@@ -251,13 +494,12 @@ impl App {
         match cmd {
             "/start" => {
                 let user = self.get_or_create_user(telegram_id)?;
-
-                if user.pin_hash.is_none() {
-                    let mut u = user;
-                    u.awaiting = Awaiting::SettingPin;
-                    self.db.save_user(&u)?;
+                if let Awaiting::SettingPin { .. } = user.awaiting {
                     self.tg.send_html(chat_id,
-                        "👻 <b>Welcome to Wraith</b>\n\nA real Solana wallet has been created for you.\n\n⚠️ <b>Important — read this once:</b>\nThis is a <b>custodial</b> wallet. Your private key is encrypted and stored on our server. The bot operator controls the master key. Only deposit funds you're comfortable with this arrangement.\n\nYou can export your private key anytime via Wallet → Export Private Key and move to your own wallet.\n\nNow set a 4-digit PIN to protect withdrawals and key export:\n\nReply with your PIN (e.g. 1234):",
+                        &format!(
+                            "👻 <b>Welcome to Wraith</b>\n\nA real Solana wallet has been created for you:\n<code>{}</code>\n\n⚠️ <b>Important — read this once:</b>\nThis is a <b>custodial</b> wallet. Your private key is encrypted at rest using your PIN combined with a server-side secret — nobody, including the bot operator, can decrypt it without your PIN.\n\nYou can export your private key anytime via Wallet → Export Private Key and move to your own wallet.\n\nNow choose a PIN (at least {} digits) to protect your wallet:",
+                            user.pubkey, self.min_pin_length
+                        ),
                         None,
                     ).await?;
                 } else {
@@ -266,6 +508,10 @@ impl App {
             }
             "/cancel" => {
                 let mut u = self.get_or_create_user(telegram_id)?;
+                if let Awaiting::SettingPin { .. } = u.awaiting {
+                    self.tg.send_html(chat_id, "You need to set a PIN before continuing — it's required to protect your wallet.", None).await?;
+                    return Ok(());
+                }
                 u.awaiting = Awaiting::None;
                 self.db.save_user(&u)?;
                 self.tg.send_html(chat_id, "Cancelled.", Some(kb::main_only())).await?;
@@ -304,6 +550,11 @@ impl App {
     pub async fn handle_callback(&self, callback_id: &str, data: &str, chat_id: i64, telegram_id: i64, message_id: Option<i64>) -> Result<()> {
         self.tg.answer_callback(callback_id, None).await.ok();
         let mut user = self.get_or_create_user(telegram_id)?;
+
+        if let Awaiting::SettingPin { .. } = user.awaiting {
+            self.tg.send_html(chat_id, &format!("🔒 Please finish setting your PIN first (at least {} digits):", self.min_pin_length), None).await?;
+            return Ok(());
+        }
 
         match data {
             "del_msg" => {
@@ -405,30 +656,17 @@ impl App {
                 }
             }
             "export_key" => {
-                if user.pin_hash.is_some() {
-                    user.awaiting = Awaiting::VerifyingPinForExport;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "🔑 Enter your PIN to export your private key:", None).await?;
-                } else {
-                    self.tg.send_html(chat_id,
-                        "🔒 You need to set a PIN before exporting your key. Go to ⚙️ Settings → Change PIN, then try again.",
-                        Some(kb::main_only()),
-                    ).await?;
-                }
+                user.awaiting = Awaiting::VerifyingPinForExport;
+                self.db.save_user(&user)?;
+                self.tg.send_html(chat_id, "🔑 Enter your PIN to export your private key:", None).await?;
             }
             "import_wallet" => {
-                if user.pin_hash.is_some() {
-                    user.awaiting = Awaiting::VerifyingPinForImport;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "🔑 Enter your PIN to import a wallet:", Some(kb::cancel_to("wallet"))).await?;
-                } else {
-                    user.awaiting = Awaiting::EnteringImportKey;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id,
-                        "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
-                        Some(kb::cancel_to("wallet")),
-                    ).await?;
-                }
+                user.awaiting = Awaiting::EnteringImportKey;
+                self.db.save_user(&user)?;
+                self.tg.send_html(chat_id,
+                    "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
+                    Some(kb::cancel_to("wallet")),
+                ).await?;
             }
             "ai_tools" => {
                 self.tg.send_html(chat_id, "🤖 <b>AI Tools</b>", Some(kb::ai_tools_menu())).await?;
@@ -457,15 +695,9 @@ impl App {
                 self.tg.send_html(chat_id, status, Some(kb::settings_menu(user.gem_alerts))).await?;
             }
             "change_pin" => {
-                if user.pin_hash.is_some() {
-                    user.awaiting = Awaiting::VerifyingPinForChangePin;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "🔑 Enter your <b>current</b> PIN to continue:", None).await?;
-                } else {
-                    user.awaiting = Awaiting::SettingPin;
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "🔑 Enter your new 4-digit PIN:", None).await?;
-                }
+                user.awaiting = Awaiting::EnteringNewPin;
+                self.db.save_user(&user)?;
+                self.tg.send_html(chat_id, &format!("🔑 Enter your <b>new</b> PIN (at least {} digits):", self.min_pin_length), None).await?;
             }
             "slippage" => {
                 self.tg.send_html(chat_id, &format!("📊 Current slippage: {:.1}%\n\nSelect:", user.slippage_bps as f64 / 100.0), Some(kb::slippage_menu())).await?;
@@ -473,14 +705,18 @@ impl App {
             "referral" => {
                 self.tg.send_html(chat_id, "👥 <b>Referral Program</b>\n\nComing soon.", Some(kb::main_only())).await?;
             }
+            other if other.starts_with("bcp_") => {
+                // Quick buy from gem/pump alerts. Uses a short "bcp_" prefix
+                // instead of "buyamt_<ca>_custom_prompt" -- that longer form
+                // could exceed Telegram's 64-byte callback_data limit once a
+                // full 44-char mint address was embedded (BUTTON_DATA_INVALID).
+                let ca = other.trim_start_matches("bcp_");
+                user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
+                self.db.save_user(&user)?;
+                self.tg.send_html(chat_id, "✏️ How much SOL do you want to spend? (e.g. <code>0.5</code>):", Some(kb::cancel_to("main"))).await?;
+            }
             other if other.starts_with("buyamt_") => {
-                if other.ends_with("_custom_prompt") {
-                    // Quick buy from gem scanner — ca is between buyamt_ and _custom_prompt
-                    let ca = other.trim_start_matches("buyamt_").trim_end_matches("_custom_prompt");
-                    user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
-                    self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "✏️ How much SOL do you want to spend? (e.g. <code>0.5</code>):", Some(kb::cancel_to("main"))).await?;
-                } else if other.ends_with("_custom") {
+                if other.ends_with("_custom") {
                     let ca = other.trim_start_matches("buyamt_").trim_end_matches("_custom");
                     user.awaiting = Awaiting::EnteringCustomBuyAmount { ca: ca.to_string() };
                     self.db.save_user(&user)?;
@@ -510,11 +746,42 @@ impl App {
                 return Ok(());
             }
         };
-        let a = dexscreener::analyze(&pair);
+        let mut a = dexscreener::analyze(&pair);
+
+        // Layer the same on-chain checks the AI Gem Scanner uses (mint/
+        // freeze authority, holder concentration) so a manually-pasted CA
+        // gets the same scrutiny as an auto-surfaced gem, not just the
+        // DexScreener-only market heuristics.
+        if let Ok((mint_ok, freeze_ok)) = self.rpc.get_mint_authority_status(ca).await {
+            if mint_ok && freeze_ok {
+                a.good.insert(0, "✅ Mint & freeze authority renounced".to_string());
+            } else {
+                a.score = (a.score - 25).max(0);
+                a.flags.insert(0, "🚨 Mint/freeze authority still active — creator retains rug control".to_string());
+            }
+        }
+        if let Ok(Some(conc)) = self.rpc.get_top10_concentration_pct(ca).await {
+            if conc > 70.0 {
+                a.score = (a.score - 15).max(0);
+                a.flags.push(format!("🚨 Top 10 wallets hold ~{conc:.0}% of supply"));
+            } else if conc < 30.0 {
+                a.good.push(format!("✅ Reasonably distributed (top 10 ~{conc:.0}%)"));
+            }
+        }
+        let (risk_level, risk_emoji) = if a.score >= 75 {
+            ("SAFE", "✅")
+        } else if a.score >= 50 {
+            ("MODERATE RISK", "⚠️")
+        } else if a.score >= 25 {
+            ("HIGH RISK", "🔴")
+        } else {
+            ("LIKELY RUG", "🚨")
+        };
+
         let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
         let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
-        let mc = pair["fdv"].as_f64().map(|v| format!("${v:.0}")).unwrap_or_else(|| "N/A".to_string());
-        let liq = pair["liquidity"]["usd"].as_f64().map(|v| format!("${v:.0}")).unwrap_or_else(|| "N/A".to_string());
+        let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
+        let liq = pair["liquidity"]["usd"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
         let price = pair["priceUsd"].as_str().unwrap_or("N/A");
 
         let flags = if a.flags.is_empty() { String::new() } else { format!("\n🚩 <b>Red Flags:</b>\n{}", a.flags.join("\n")) };
@@ -522,7 +789,7 @@ impl App {
 
         self.tg.send_html(chat_id, &format!(
             "🔍 <b>{name} ({symbol})</b>\n📋 <code>{ca}</code>\n\n💎 MC: {mc}\n💧 Liq: {liq}\n💵 Price: ${price}\n\n{} <b>Risk: {}/100 — {}</b>{flags}{good}\n\nSelect buy amount:",
-            a.risk_emoji, a.score, a.risk_level
+            risk_emoji, a.score, risk_level
         ), Some(kb::buy_amounts(ca))).await?;
         Ok(())
     }
@@ -534,6 +801,7 @@ impl App {
             Some(pair) => pair,
             None => return Ok(()),
         };
+        let ca = ca.to_string();
         let amount_sol: f64 = amt_str.parse().unwrap_or(0.0);
         let mut user = self.get_or_create_user(telegram_id)?;
 
@@ -543,6 +811,21 @@ impl App {
             return Ok(());
         }
 
+        if let Some(kp) = self.session_keypair(telegram_id) {
+            self.execute_buy(chat_id, &mut user, &kp, &ca, amount_sol).await?;
+        } else {
+            if let Some(m) = lockout_message(&user) {
+                self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
+                return Ok(());
+            }
+            user.awaiting = Awaiting::VerifyingPinForBuy { ca, amount_sol };
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔑 Enter your PIN to unlock trading (stays unlocked for 15 minutes):", Some(kb::cancel_to("main"))).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_buy(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str, amount_sol: f64) -> Result<()> {
         self.tg.send_html(chat_id, "⚡ Getting quote...", None).await?;
 
         let lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -564,13 +847,11 @@ impl App {
 
         self.tg.send_html(chat_id, "⚡ Executing swap...", None).await?;
 
-        match self.sign_and_send_swap(&user, &quote).await {
+        match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
             Ok(sig) => {
                 let est_out_raw = out_amount(&quote).unwrap_or(0);
                 let symbol = ca.chars().take(6).collect::<String>().to_uppercase();
 
-                // Best-effort lookups — if either fails we still record the
-                // position, just without a usable entry price for P&L later.
                 let decimals = self.rpc.get_mint_decimals(ca).await.unwrap_or(9);
                 let entry_price_usd = dexscreener::get_token_pair(ca)
                     .await
@@ -593,7 +874,7 @@ impl App {
                     entry_price_usd,
                     decimals,
                 });
-                self.db.save_user(&user)?;
+                self.db.save_user(user)?;
                 self.tg.send_html(chat_id, &format!(
                     "✅ <b>Swap sent</b>\n\n💸 Spent: {amount_sol} SOL{usd_line}\n🪙 Tokens: {human_tokens:.2}{entry_line}\n🔗 Tx: <code>{sig}</code>\n\nCheck the signature on Solscan to confirm it landed."
                 ), Some(kb::main_only())).await?;
@@ -605,7 +886,23 @@ impl App {
         Ok(())
     }
 
-    async fn handle_sell_ca(&self, chat_id: i64, user: &UserRecord, ca: &str) -> Result<()> {
+    async fn handle_sell_ca(&self, chat_id: i64, telegram_id: i64, ca: &str) -> Result<()> {
+        let mut user = self.get_or_create_user(telegram_id)?;
+        if let Some(kp) = self.session_keypair(telegram_id) {
+            self.execute_sell(chat_id, &mut user, &kp, ca).await?;
+        } else {
+            if let Some(m) = lockout_message(&user) {
+                self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
+                return Ok(());
+            }
+            user.awaiting = Awaiting::VerifyingPinForSell { ca: ca.to_string() };
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔑 Enter your PIN to unlock trading (stays unlocked for 15 minutes):", Some(kb::cancel_to("main"))).await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_sell(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str) -> Result<()> {
         let (raw_balance, decimals) = match self.rpc.get_token_balance(&user.pubkey, ca).await {
             Ok(v) => v,
             Err(e) => {
@@ -628,15 +925,13 @@ impl App {
             }
         };
 
-        match self.sign_and_send_swap(user, &quote).await {
+        match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
             Ok(sig) => {
                 let est_out_sol = out_amount(&quote).unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 let human_amount = raw_balance as f64 / 10f64.powi(decimals as i32);
 
-                // Remove position from tracking
-                let mut updated_user = self.db.get_user(user.telegram_id)?.unwrap_or_else(|| user.clone());
-                updated_user.positions.retain(|p| p.mint != ca);
-                self.db.save_user(&updated_user)?;
+                user.positions.retain(|p| p.mint != ca);
+                self.db.save_user(user)?;
 
                 self.tg.send_html(chat_id, &format!(
                     "✅ <b>Sell sent</b>\n\n🪙 Sold: ~{human_amount:.4} tokens\n💰 Est. received: {est_out_sol:.4} SOL\n🔗 Tx: <code>{sig}</code>"
@@ -649,9 +944,8 @@ impl App {
         Ok(())
     }
 
-    async fn sign_and_send_swap(&self, user: &UserRecord, quote: &serde_json::Value) -> Result<String> {
-        let keypair = wallet::load_keypair(&self.crypto, user)?;
-        let swap_tx_b64 = self.jup.get_swap_transaction(quote, &user.pubkey, &self.fee_wallet).await?;
+    async fn sign_and_send_swap(&self, keypair: &Keypair, pubkey: &str, quote: &serde_json::Value) -> Result<String> {
+        let swap_tx_b64 = self.jup.get_swap_transaction(quote, pubkey, &self.fee_wallet).await?;
 
         let tx_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, swap_tx_b64)?;
         let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
@@ -670,7 +964,7 @@ impl App {
         self.rpc.send_raw_transaction_b64(&signed_b64).await
     }
 
-    async fn do_withdraw(&self, chat_id: i64, user: &UserRecord, dest: &str, amount_sol: f64) -> Result<()> {
+    async fn do_withdraw(&self, chat_id: i64, keypair: &Keypair, dest: &str, amount_sol: f64) -> Result<()> {
         let dest_pubkey = match Pubkey::from_str(dest) {
             Ok(p) => p,
             Err(_) => {
@@ -679,14 +973,13 @@ impl App {
             }
         };
 
-        let keypair = wallet::load_keypair(&self.crypto, user)?;
         let lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
         let blockhash_str = self.rpc.get_latest_blockhash().await?;
         let blockhash = solana_sdk::hash::Hash::from_str(&blockhash_str)?;
 
         let instruction = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, lamports);
         let mut tx = Transaction::new_with_payer(&[instruction], Some(&keypair.pubkey()));
-        tx.sign(&[&keypair], blockhash);
+        tx.sign(&[keypair], blockhash);
 
         let tx_bytes = bincode::serialize(&tx)?;
         let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tx_bytes);
@@ -723,12 +1016,128 @@ impl App {
         Ok(())
     }
 
-    pub async fn run_gem_scanner(&self) {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+    /// Layers on-chain safety checks (mint/freeze authority, holder
+    /// concentration) on top of the DexScreener-only market score.
+    async fn apply_onchain_checks(&self, ca: &str, signal: &mut dexscreener::GemSignal) {
+        if signal.score < 45 {
+            return;
+        }
 
-            let pairs = match dexscreener::get_trending_solana_pairs().await {
+        if let Ok((mint_ok, freeze_ok)) = self.rpc.get_mint_authority_status(ca).await {
+            if mint_ok && freeze_ok {
+                signal.score = (signal.score + 15).min(100);
+                signal.notes.insert(0, "✅ Mint & freeze authority renounced".to_string());
+            } else {
+                signal.score = (signal.score - 25).max(0);
+                signal.notes.insert(0, "🚨 Mint/freeze authority still active — creator retains rug control".to_string());
+            }
+        }
+
+        if let Ok(Some(conc)) = self.rpc.get_top10_concentration_pct(ca).await {
+            if conc > 70.0 {
+                signal.score = (signal.score - 15).max(0);
+                signal.notes.push(format!("🚨 Top 10 wallets hold ~{conc:.0}% of supply"));
+            } else if conc < 30.0 {
+                signal.notes.push(format!("✅ Reasonably distributed (top 10 ~{conc:.0}%)"));
+            }
+        }
+
+        signal.tier = dexscreener::tier_for_score(signal.score);
+    }
+
+    /// Handles one event from the PumpPortal WebSocket feed -- the earliest
+    /// possible signal, since tokens land here at creation, before
+    /// DexScreener has any listing for them.
+    pub async fn handle_pump_event(&self, event: PumpEvent) {
+        match event {
+            PumpEvent::NewToken(data) => {
+                // Way too high volume to alert on (hundreds/min) -- just
+                // track first_seen so later stages know how early we caught it.
+                if self.db.get_pump_watch(&data.mint).ok().flatten().is_none() {
+                    let _ = self.db.save_pump_watch(&data.mint, &crate::db::PumpWatch {
+                        name: data.name,
+                        symbol: data.symbol,
+                        first_seen: crate::state::chrono_now(),
+                        alerted_curve: false,
+                        alerted_migration: false,
+                    });
+                }
+            }
+
+            PumpEvent::CurveProgress(data) => {
+                let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or(crate::db::PumpWatch {
+                    name: data.name.clone(),
+                    symbol: data.symbol.clone(),
+                    first_seen: crate::state::chrono_now(),
+                    alerted_curve: false,
+                    alerted_migration: false,
+                });
+                if watch.alerted_curve {
+                    return;
+                }
+                watch.alerted_curve = true;
+                let _ = self.db.save_pump_watch(&data.mint, &watch);
+
+                let pct = (data.v_sol_in_bonding_curve / MIGRATION_SOL_APPROX_FOR_DISPLAY * 100.0).min(100.0);
+                let msg = format!(
+                    "👀 <b>Early Watch — Pump.fun</b>\n\n🪙 <b>{} (${})</b>\n📋 <code>{}</code>\n📈 Bonding curve: ~{pct:.0}% toward migration\n\n⚠️ Still pre-migration — <b>not buyable through this bot yet</b>. Worth watching; a migration alert will follow if it graduates.",
+                    if watch.name.is_empty() { "Unknown" } else { &watch.name },
+                    if watch.symbol.is_empty() { "???" } else { &watch.symbol },
+                    data.mint,
+                );
+                self.broadcast_to_gem_alert_subscribers(&msg, None).await;
+            }
+
+            PumpEvent::Migrated(data) => {
+                let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or(crate::db::PumpWatch {
+                    name: data.name.clone(),
+                    symbol: data.symbol.clone(),
+                    first_seen: crate::state::chrono_now(),
+                    alerted_curve: false,
+                    alerted_migration: false,
+                });
+                if watch.alerted_migration {
+                    return;
+                }
+                watch.alerted_migration = true;
+                let _ = self.db.save_pump_watch(&data.mint, &watch);
+
+                let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
+                let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
+                let msg = format!(
+                    "🚀 <b>Just Migrated!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{}</code>\n\nGraduated from the pump.fun bonding curve to a real trading pool — demand pushed it all the way through. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — migration doesn't guarantee it holds.</i>",
+                    data.mint,
+                );
+                let kb = vec![
+                    vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("bcp_{}", data.mint))],
+                    vec![crate::telegram::btn("❌ Skip", "main")],
+                ];
+                self.broadcast_to_gem_alert_subscribers(&msg, Some(kb)).await;
+            }
+        }
+    }
+
+    async fn broadcast_to_gem_alert_subscribers(&self, msg: &str, kb: Option<Vec<Vec<crate::telegram::InlineButton>>>) {
+        for item in self.db.inner_iter() {
+            if let Ok((_, bytes)) = item {
+                if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
+                    if user.gem_alerts {
+                        self.tg.send_html(user.telegram_id, msg, kb.clone()).await.ok();
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn run_gem_scanner(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            let addrs = match dexscreener::get_candidate_addresses().await {
+                Ok(a) if !a.is_empty() => a,
+                _ => continue,
+            };
+            let pairs = match dexscreener::get_pairs_for_addresses(&addrs).await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -738,44 +1147,46 @@ impl App {
                     Some(a) => a.to_string(),
                     None => continue,
                 };
-                if seen.contains(&ca) { continue; }
 
-                let a = dexscreener::analyze(pair);
-                if a.score < 65 { continue; }
+                let prev = self.db.get_gem_snapshot(&ca).ok().flatten();
+                let prev_snap = prev.as_ref().map(|p| dexscreener::Snapshot { liq_usd: p.liq_usd, vol_h24: p.vol_h24 });
+                let mut signal = dexscreener::score_gem(pair, prev_snap.as_ref());
+                self.apply_onchain_checks(&ca, &mut signal).await;
 
-                seen.insert(ca.clone());
-                if seen.len() > 500 { seen.clear(); }
+                let liq = pair["liquidity"]["usd"].as_f64().unwrap_or(0.0);
+                let vol = pair["volume"]["h24"].as_f64().unwrap_or(0.0);
+                let now = crate::state::chrono_now();
+                let already_alerted = prev.as_ref().map(|p| p.alerted).unwrap_or(false);
+                let first_seen = prev.as_ref().map(|p| p.first_seen).unwrap_or(now);
+
+                let should_alert = !already_alerted && signal.score >= 60;
+                let _ = self.db.save_gem_snapshot(&ca, &crate::db::GemSnapshot {
+                    liq_usd: liq,
+                    vol_h24: vol,
+                    first_seen,
+                    alerted: already_alerted || should_alert,
+                });
+
+                if !should_alert { continue; }
 
                 let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
                 let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
-                let mc = pair["fdv"].as_f64().map(|v| {
-                    if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
-                    else { format!("${:.0}K", v / 1_000.0) }
-                }).unwrap_or_else(|| "N/A".to_string());
-                let liq = pair["liquidity"]["usd"].as_f64()
-                    .map(|v| format!("${:.0}K", v / 1_000.0))
-                    .unwrap_or_else(|| "N/A".to_string());
+                let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
+                let liq_disp = fmt_usd(liq);
                 let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
-                let upside = if a.score >= 80 { "🚀 High potential" } else { "⚡ Moderate potential" };
+                let fresh_tag = if signal.is_fresh { "🆕 " } else { "" };
+                let notes = signal.notes.iter().take(4).map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n");
 
                 let msg = format!(
-                    "💎 <b>Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100\n🎯 {upside}\n\n<i>Tap buy to trade instantly 👇</i>",
-                    a.score
+                    "💎 <b>{fresh_tag}Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq_disp} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}\n{notes}\n\n<i>Tap buy to trade instantly 👇</i>",
+                    signal.score, signal.tier
                 );
                 let kb = vec![
-                    vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("buyamt_{ca}_custom_prompt"))],
+                    vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("bcp_{ca}"))],
                     vec![crate::telegram::btn("❌ Skip", "main")],
                 ];
 
-                for item in self.db.inner_iter() {
-                    if let Ok((_, bytes)) = item {
-                        if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
-                            if user.gem_alerts {
-                                self.tg.send_html(user.telegram_id, &msg, Some(kb.clone())).await.ok();
-                            }
-                        }
-                    }
-                }
+                self.broadcast_to_gem_alert_subscribers(&msg, Some(kb)).await;
             }
         }
     }
@@ -855,52 +1266,15 @@ impl App {
             return Ok(());
         }
 
-        // Filter using real gem criteria
-        let mut gems: Vec<(&serde_json::Value, i32, String)> = vec![];
-
+        let mut gems: Vec<(&serde_json::Value, dexscreener::GemSignal)> = vec![];
         for pair in &pairs {
-            let mc = pair["fdv"].as_f64().unwrap_or(0.0);
-            let liq = pair["liquidity"]["usd"].as_f64().unwrap_or(0.0);
-            let vol24h = pair["volume"]["h24"].as_f64().unwrap_or(0.0);
-            let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
-            let buys = pair["txns"]["h24"]["buys"].as_i64().unwrap_or(0);
-            let sells = pair["txns"]["h24"]["sells"].as_i64().unwrap_or(0);
-
-            // Skip obvious rugs and too-big tokens
-            if mc <= 0.0 || liq < 5_000.0 || mc > 500_000_000.0 { continue; }
-
-            let mut score = 0i32;
-            let mut narrative = String::new();
-
-            // Sweet spot MC: $50K–$50M
-            if mc >= 50_000.0 && mc <= 50_000_000.0 { score += 25; }
-            else if mc < 50_000.0 { score += 15; } // ultra early, risky
-
-            // Healthy liq/MC ratio
-            if liq / mc > 0.05 { score += 20; narrative += "Strong liquidity. "; }
-            else if liq / mc > 0.02 { score += 10; }
-
-            // Buy pressure
-            if buys > sells * 2 { score += 20; narrative += "Heavy buy pressure. "; }
-            else if buys > sells { score += 10; }
-
-            // Volume relative to MC
-            let vol_ratio = if mc > 0.0 { vol24h / mc } else { 0.0 };
-            if vol_ratio > 0.1 { score += 15; narrative += "High volume activity. "; }
-            else if vol_ratio > 0.05 { score += 8; }
-
-            // Momentum
-            if change1h > 5.0 && change1h < 80.0 { score += 10; narrative += "Healthy momentum. "; }
-            else if change1h > 80.0 { score -= 5; narrative += "Possibly over-extended. "; }
-
-            // DEX quality
-            if let Some(dex) = pair["dexId"].as_str() {
-                if matches!(dex, "raydium" | "orca" | "meteora") { score += 10; }
-            }
-
-            if score >= 40 {
-                if narrative.is_empty() { narrative = "Early stage with moderate signals.".to_string(); }
-                gems.push((pair, score, narrative));
+            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
+            let prev = self.db.get_gem_snapshot(ca).ok().flatten();
+            let prev_snap = prev.as_ref().map(|p| dexscreener::Snapshot { liq_usd: p.liq_usd, vol_h24: p.vol_h24 });
+            let mut signal = dexscreener::score_gem(pair, prev_snap.as_ref());
+            self.apply_onchain_checks(ca, &mut signal).await;
+            if signal.score >= 40 {
+                gems.push((pair, signal));
             }
         }
 
@@ -909,38 +1283,35 @@ impl App {
             return Ok(());
         }
 
-        // Sort by score
-        gems.sort_by(|a, b| b.1.cmp(&a.1));
+        gems.sort_by(|a, b| b.1.score.cmp(&a.1.score));
 
         let mut msg = "💎 <b>AI Gem Scanner — Top Picks</b>\n\n".to_string();
-        for (pair, score, narrative) in gems.iter().take(5) {
+        for (pair, signal) in gems.iter().take(5) {
             let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
             let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
             let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
-            let mc = pair["fdv"].as_f64().map(|v| {
-                if v >= 1_000_000.0 { format!("${:.1}M", v / 1_000_000.0) }
-                else { format!("${:.0}K", v / 1_000.0) }
-            }).unwrap_or_else(|| "N/A".to_string());
-            let liq = pair["liquidity"]["usd"].as_f64().map(|v| format!("${:.0}K", v / 1_000.0)).unwrap_or_else(|| "N/A".to_string());
+            let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
+            let liq = pair["liquidity"]["usd"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
             let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
-            let upside = if *score >= 70 { "🚀 High (5–20x potential)" }
-                else if *score >= 55 { "⚡ Moderate (2–5x potential)" }
-                else { "👀 Speculative (DYOR)" };
+            let fresh_tag = if signal.is_fresh { "🆕 " } else { "" };
+            let top_note = if signal.notes.is_empty() { String::new() } else {
+                format!("\n{}", signal.notes.iter().take(2).cloned().collect::<Vec<_>>().join(" | "))
+            };
 
             msg += &format!(
-                "━━━━━━━━━━━━\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {score}/100\n🎯 {upside}\n\n"
+                "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}{top_note}\n\n",
+                signal.score, signal.tier
             );
         }
         msg += "⚠️ <i>Not financial advice. Always DYOR before buying.</i>";
 
-        // Build keyboard with quick buy buttons for each gem
         let mut kb: Vec<Vec<crate::telegram::InlineButton>> = vec![];
-        for (pair, score, _) in gems.iter().take(5) {
+        for (pair, signal) in gems.iter().take(5) {
             let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
             let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
-            let stars = if *score >= 70 { "🚀" } else if *score >= 55 { "⚡" } else { "👀" };
+            let stars = if signal.score >= 75 { "🚀" } else if signal.score >= 55 { "⚡" } else { "👀" };
             kb.push(vec![
-                crate::telegram::btn(&format!("{stars} Buy ${symbol}"), &format!("buyamt_{ca}_custom_prompt")),
+                crate::telegram::btn(&format!("{stars} Buy ${symbol}"), &format!("bcp_{ca}")),
             ]);
         }
         kb.push(vec![crate::telegram::btn("🏠 Main Menu", "main")]);
@@ -959,7 +1330,7 @@ impl App {
         for p in &pairs {
             let symbol = p["baseToken"]["symbol"].as_str().unwrap_or("???");
             let change1h = p["priceChange"]["h1"].as_f64().unwrap_or(0.0);
-            let mc = p["fdv"].as_f64().map(|v| format!("${v:.0}")).unwrap_or_else(|| "N/A".to_string());
+            let mc = p["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
             msg += &format!("• <b>{symbol}</b> {change1h:.1}% (1h) | MC: {mc}\n");
         }
         self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
@@ -967,11 +1338,40 @@ impl App {
     }
 }
 
-fn check_pin(user: &UserRecord, attempt: &str) -> bool {
-    match &user.pin_hash {
-        Some(h) => *h == hash_pin(attempt),
-        None => true,
+fn lockout_message(user: &UserRecord) -> Option<String> {
+    let now = crate::state::chrono_now();
+    let secs = user.pin_lockout.seconds_remaining(now);
+    if secs <= 0 {
+        return None;
     }
+    Some(format!("🔒 Too many wrong PIN attempts. Try again in {}.", fmt_duration(secs)))
+}
+
+fn fmt_duration(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", (secs + 59) / 60)
+    } else {
+        format!("{}h", (secs + 3599) / 3600)
+    }
+}
+
+/// Formats a USD amount with full comma thousands separators, e.g.
+/// 1234567.0 -> "$1,234,567" (instead of the old abbreviated "$1.2M").
+fn fmt_usd(v: f64) -> String {
+    let neg = v < 0.0;
+    let whole = v.abs().round() as i64;
+    let digits = whole.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i != 0 && i % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    let grouped: String = grouped.chars().rev().collect();
+    format!("${}{}", if neg { "-" } else { "" }, grouped)
 }
 
 fn short_wallet(w: &str) -> String {

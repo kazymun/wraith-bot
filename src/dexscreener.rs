@@ -10,37 +10,235 @@ pub async fn get_token_pair(ca: &str) -> Result<Option<Value>> {
     Ok(resp["pairs"].as_array().and_then(|p| p.first()).cloned())
 }
 
-pub async fn get_trending_solana_pairs() -> Result<Vec<Value>> {
-    let client = reqwest::Client::builder()
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
-        .build()?;
+        .build()
+        .unwrap_or_default()
+}
 
-    // Get boosted tokens list
-    let boosts: serde_json::Value = client
-        .get("https://api.dexscreener.com/token-boosts/latest/v1")
-        .send().await?.json().await?;
+fn push_solana_addrs(v: &Value, out: &mut Vec<String>) {
+    if let Some(arr) = v.as_array() {
+        for t in arr {
+            if t["chainId"].as_str() == Some("solana") {
+                if let Some(a) = t["tokenAddress"].as_str() {
+                    out.push(a.to_string());
+                }
+            }
+        }
+    }
+}
 
-    let addrs: Vec<String> = boosts.as_array()
-        .cloned().unwrap_or_default()
-        .into_iter()
-        .filter(|t| t["chainId"].as_str() == Some("solana"))
-        .take(6)
-        .filter_map(|t| t["tokenAddress"].as_str().map(|s| s.to_string()))
-        .collect();
+/// Pulls candidate Solana token addresses from several DexScreener feeds:
+/// - token-boosts (latest + top): paid promotion, wide reach but often already pumped
+/// - token-profiles/latest: freely submitted the moment a project fills in its
+///   socials/website, usually right at launch — this is our earliest-signal source
+///
+/// Merging these (instead of relying on boosts alone) is what lets us catch
+/// tokens before they're hyped, not just after.
+pub async fn get_candidate_addresses() -> Result<Vec<String>> {
+    let client = http_client();
+    let mut addrs: Vec<String> = vec![];
 
-    if addrs.is_empty() { return Ok(vec![]); }
+    for url in [
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-boosts/top/v1",
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+    ] {
+        if let Ok(resp) = client.get(url).send().await {
+            if let Ok(v) = resp.json::<Value>().await {
+                push_solana_addrs(&v, &mut addrs);
+            }
+        }
+    }
 
-    // Batch fetch all pairs in one call
-    let joined = addrs.join(",");
-    let url = format!("https://api.dexscreener.com/latest/dex/tokens/{joined}");
-    let resp: serde_json::Value = client.get(&url).send().await?.json().await?;
+    addrs.sort();
+    addrs.dedup();
+    addrs.truncate(90); // 3 batched calls of 30 addrs max
+    Ok(addrs)
+}
 
-    Ok(resp["pairs"].as_array()
-        .cloned().unwrap_or_default()
-        .into_iter()
-        .filter(|p| p["chainId"].as_str() == Some("solana"))
-        .take(6)
-        .collect())
+/// Batches address lookups (DexScreener's tokens endpoint accepts up to ~30
+/// comma-separated addresses per call).
+pub async fn get_pairs_for_addresses(addrs: &[String]) -> Result<Vec<Value>> {
+    if addrs.is_empty() {
+        return Ok(vec![]);
+    }
+    let client = http_client();
+    let mut out = vec![];
+
+    for chunk in addrs.chunks(30) {
+        let joined = chunk.join(",");
+        let url = format!("https://api.dexscreener.com/latest/dex/tokens/{joined}");
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(v) = resp.json::<Value>().await {
+                if let Some(pairs) = v["pairs"].as_array() {
+                    out.extend(pairs.iter().filter(|p| p["chainId"].as_str() == Some("solana")).cloned());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Kept for the manual "AI Gem Scanner" button — same broadened candidate
+/// pool, single call.
+pub async fn get_trending_solana_pairs() -> Result<Vec<Value>> {
+    let addrs = get_candidate_addresses().await?;
+    get_pairs_for_addresses(&addrs).await
+}
+
+/// Minimal snapshot of a token from a previous scan, used to detect momentum
+/// (rising liquidity/volume) between polling intervals rather than judging
+/// off a single static reading.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub liq_usd: f64,
+    pub vol_h24: f64,
+}
+
+pub struct GemSignal {
+    pub score: i32,
+    pub tier: &'static str,
+    pub notes: Vec<String>,
+    pub is_fresh: bool,
+}
+
+pub fn tier_for_score(score: i32) -> &'static str {
+    if score >= 75 {
+        "🚀 STRONG"
+    } else if score >= 55 {
+        "⚡ MODERATE"
+    } else if score >= 40 {
+        "👀 WATCH"
+    } else {
+        "SKIP"
+    }
+}
+
+/// Early-gem scoring. Unlike `analyze()` (which is tuned for rug-risk on a
+/// token the user already picked), this is tuned to surface promising tokens
+/// *before* they're widely noticed:
+/// - freshness is rewarded, not penalized, as long as basic safety floors hold
+/// - short-horizon (5m/1h) buy/sell pressure is weighted alongside 24h data
+/// - momentum vs. the last scan (if we have one) adds/subtracts points
+///
+/// This only looks at DexScreener market data. On-chain checks (mint/freeze
+/// authority, holder concentration) are layered on separately in the caller
+/// since they require RPC calls - see `App::apply_onchain_checks`.
+pub fn score_gem(pair: &Value, prev: Option<&Snapshot>) -> GemSignal {
+    let mc = f(pair, &["fdv"]);
+    let liq = f(pair, &["liquidity", "usd"]);
+    let vol24h = f(pair, &["volume", "h24"]);
+    let buys5m = pair["txns"]["m5"]["buys"].as_i64().unwrap_or(0);
+    let sells5m = pair["txns"]["m5"]["sells"].as_i64().unwrap_or(0);
+    let buys1h = pair["txns"]["h1"]["buys"].as_i64().unwrap_or(0);
+    let sells1h = pair["txns"]["h1"]["sells"].as_i64().unwrap_or(0);
+    let change1h = f(pair, &["priceChange", "h1"]);
+
+    // Hard safety floor — skip obvious no-liquidity junk outright.
+    if liq < 3_000.0 || mc <= 0.0 {
+        return GemSignal { score: 0, tier: "SKIP", notes: vec!["Below safety floor".to_string()], is_fresh: false };
+    }
+
+    let mut score = 0i32;
+    let mut notes = vec![];
+
+    // Several trader writeups converge on a rough "sweet spot" market-cap
+    // band for early entries (not too microscopic, not already mature) -
+    // treat this as a mild tiebreaker, not a hard rule.
+    if mc >= 70_000.0 && mc <= 11_000_000.0 {
+        score += 5;
+    }
+
+    let age_hours = pair
+        .get("pairCreatedAt")
+        .and_then(|v| v.as_i64())
+        .map(|created| (chrono_now_ms() - created) as f64 / 3_600_000.0)
+        .unwrap_or(999.0);
+    let is_fresh = age_hours < 6.0;
+
+    if age_hours < 1.0 && liq > 8_000.0 {
+        score += 20;
+        notes.push("🆕 Brand new (<1h) with real liquidity".to_string());
+    } else if age_hours < 6.0 {
+        score += 12;
+        notes.push("🆕 Very early (<6h)".to_string());
+    } else if age_hours < 24.0 {
+        score += 6;
+    }
+
+    if liq >= 15_000.0 {
+        score += 15;
+    } else if liq >= 8_000.0 {
+        score += 8;
+    } else {
+        score -= 5;
+        notes.push("⚠️ Thin liquidity".to_string());
+    }
+
+    let liq_mc = if mc > 0.0 { liq / mc } else { 0.0 };
+    if liq_mc > 0.08 {
+        score += 10;
+        notes.push("Healthy liquidity/MC ratio".to_string());
+    } else if liq_mc < 0.015 {
+        score -= 10;
+        notes.push("⚠️ Low liquidity/MC ratio".to_string());
+    }
+
+    if buys5m + sells5m >= 5 {
+        if buys5m > sells5m * 2 {
+            score += 15;
+            notes.push("🔥 Strong 5m buy pressure".to_string());
+        } else if sells5m > buys5m * 2 {
+            score -= 15;
+            notes.push("🚨 5m sell-off".to_string());
+        }
+    }
+    if buys1h + sells1h >= 10 {
+        if buys1h > sells1h * 2 {
+            score += 12;
+            notes.push("Buy pressure building over the last hour".to_string());
+        } else if sells1h > buys1h * 3 {
+            score -= 20;
+            notes.push("🚨 Heavy 1h sell pressure".to_string());
+        }
+    }
+
+    if let Some(p) = prev {
+        if p.liq_usd > 0.0 {
+            let liq_growth = (liq - p.liq_usd) / p.liq_usd;
+            if liq_growth > 0.25 {
+                score += 12;
+                notes.push(format!("💧 Liquidity up {:.0}% since last scan", liq_growth * 100.0));
+            }
+        }
+        if p.vol_h24 > 0.0 {
+            let vol_growth = (vol24h - p.vol_h24) / p.vol_h24;
+            if vol_growth > 0.5 {
+                score += 10;
+                notes.push("📈 Volume accelerating".to_string());
+            }
+        }
+    }
+
+    if change1h > 200.0 {
+        score -= 15;
+        notes.push("⚠️ Already up huge — chasing risk".to_string());
+    } else if change1h > 15.0 && change1h < 150.0 {
+        score += 8;
+    }
+
+    if let Some(dex) = pair["dexId"].as_str() {
+        if matches!(dex, "raydium" | "orca" | "meteora" | "pumpswap") {
+            score += 5;
+        }
+    }
+
+    score = score.clamp(0, 100);
+    let tier = tier_for_score(score);
+
+    GemSignal { score, tier, notes, is_fresh }
 }
 
 pub struct Analysis {

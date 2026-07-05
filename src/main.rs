@@ -5,6 +5,7 @@ mod dexscreener;
 mod handlers;
 mod jupiter;
 mod keyboards;
+mod pumpportal;
 mod rpc;
 mod state;
 mod telegram;
@@ -22,22 +23,38 @@ use telegram::TgClient;
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::load()?;
 
-    let app = App {
-        tg: TgClient::new(cfg.telegram_token.clone()),
-        db: Db::open(&cfg.db_path)?,
-        crypto: Crypto::new(&cfg.master_key_b64)?,
-        rpc: SolanaRpc::new(cfg.rpc_url.clone()),
-        jup: Jupiter::new(),
-        default_slippage_bps: cfg.default_slippage_bps,
-        fee_wallet: cfg.fee_wallet.clone(),
-    };
+    let app = App::new(
+        TgClient::new(cfg.telegram_token.clone()),
+        Db::open(&cfg.db_path)?,
+        Crypto::new(&cfg.pepper_b64)?,
+        SolanaRpc::new(cfg.rpc_url.clone()),
+        Jupiter::new(cfg.jupiter_api_key.clone()),
+        cfg.default_slippage_bps,
+        cfg.fee_wallet.clone(),
+        cfg.min_pin_length,
+    );
 
     println!("👻 Wraith bot is running...");
 
-    // Spawn background gem scanner
+    // Spawn background gem scanner (DexScreener-based)
     let scanner_app = app.clone();
     tokio::spawn(async move {
         scanner_app.run_gem_scanner().await;
+    });
+
+    // Spawn the PumpPortal WebSocket listener -- the earliest possible
+    // signal, since tokens land here at creation, before DexScreener has
+    // any listing for them. Runs alongside the DexScreener scanner, not
+    // instead of it.
+    let (pump_tx, mut pump_rx) = tokio::sync::mpsc::channel::<pumpportal::PumpEvent>(1000);
+    tokio::spawn(async move {
+        pumpportal::run(pump_tx).await;
+    });
+    let pump_app = app.clone();
+    tokio::spawn(async move {
+        while let Some(event) = pump_rx.recv().await {
+            pump_app.handle_pump_event(event).await;
+        }
     });
 
     let mut offset: i64 = 0;

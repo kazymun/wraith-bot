@@ -4,10 +4,21 @@ use anyhow::{Context, Result};
 pub struct Config {
     pub telegram_token: String,
     pub rpc_url: String,
-    pub master_key_b64: String,
+    pub pepper_b64: String,
     pub db_path: String,
     pub default_slippage_bps: u32,
     pub fee_wallet: String,
+    /// Optional Jupiter API key (get one free at https://portal.jup.ag).
+    /// If set, we use https://api.jup.ag with the key attached (recommended
+    /// -- your own rate limit, more future-proof). If unset, we fall back
+    /// to the no-key https://lite-api.jup.ag endpoint so the bot still
+    /// works out of the box.
+    pub jupiter_api_key: Option<String>,
+    /// Minimum PIN length. 4 digits is 10,000 combinations -- crackable
+    /// against a stolen DB dump even with Argon2id given enough time on
+    /// attacker hardware. 6+ raises that to 1,000,000+ combinations.
+    /// Enforce this in handlers.rs wherever a PIN is set or changed.
+    pub min_pin_length: usize,
 }
 
 impl Config {
@@ -18,8 +29,12 @@ impl Config {
             .context("TELEGRAM_BOT_TOKEN is not set")?;
         let rpc_url = std::env::var("SOLANA_RPC_URL")
             .context("SOLANA_RPC_URL is not set")?;
-        let master_key_b64 = std::env::var("WRAITH_MASTER_KEY")
-            .context("WRAITH_MASTER_KEY is not set. Generate one with `openssl rand -base64 32`")?;
+        let pepper_b64 = std::env::var("WRAITH_PEPPER")
+            .context(
+                "WRAITH_PEPPER is not set. Generate one with `openssl rand -base64 32` \
+                 and store it somewhere DIFFERENT from your database backups \
+                 (secrets manager / KMS, not the same disk or repo).",
+            )?;
         let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "./wraith_db".to_string());
         let default_slippage_bps: u32 = std::env::var("DEFAULT_SLIPPAGE_BPS")
             .unwrap_or_else(|_| "500".to_string())
@@ -29,14 +44,26 @@ impl Config {
             eprintln!("⚠️  FEE_WALLET not set in .env — platform fee will be skipped on swaps.");
             String::new()
         });
+        let min_pin_length: usize = std::env::var("MIN_PIN_LENGTH")
+            .unwrap_or_else(|_| "6".to_string())
+            .parse()
+            .unwrap_or(6);
+        let jupiter_api_key = std::env::var("JUPITER_API_KEY").ok().filter(|s| !s.is_empty());
+
+        // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
+        // key anywhere that decrypts every user's wallet. Each user's
+        // secret requires their own PIN combined with this pepper --
+        // see crypto.rs for the envelope-encryption scheme.
 
         Ok(Self {
             telegram_token,
             rpc_url,
-            master_key_b64,
+            pepper_b64,
             db_path,
             default_slippage_bps,
             fee_wallet,
+            min_pin_length,
+            jupiter_api_key,
         })
     }
 }

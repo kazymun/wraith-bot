@@ -64,7 +64,26 @@ pub fn btn(text: &str, data: &str) -> InlineButton {
 
 pub type Keyboard = Vec<Vec<InlineButton>>;
 
+/// A wrapper around anyhow::Error that guarantees the bot token can never
+/// appear in its Display output, even if the underlying reqwest error
+/// includes the full request URL (which contains `bot<TOKEN>/...`).
+/// ALWAYS use this (never the raw reqwest/anyhow error) anywhere a
+/// TgClient error might get logged, eprintln'd, or shown to a user.
+#[derive(Debug)]
+pub struct SafeTgError(String);
+
+impl std::fmt::Display for SafeTgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for SafeTgError {}
+
 impl TgClient {
+    fn redact(&self, s: impl AsRef<str>) -> SafeTgError {
+        SafeTgError(s.as_ref().replace(&self.token, "[REDACTED_BOT_TOKEN]"))
+    }
+
     pub fn new(token: String) -> Self {
         Self {
             token,
@@ -82,9 +101,11 @@ impl TgClient {
             .get(self.url("getUpdates"))
             .query(&[("offset", offset.to_string()), ("timeout", "30".to_string())])
             .send()
-            .await?
+            .await
+            .map_err(|e| self.redact(e.to_string()))?
             .json()
-            .await?;
+            .await
+            .map_err(|e| self.redact(e.to_string()))?;
         Ok(resp.result.unwrap_or_default())
     }
 
@@ -102,9 +123,11 @@ impl TgClient {
             .post(self.url("sendMessage"))
             .json(&body)
             .send()
-            .await?
+            .await
+            .map_err(|e| self.redact(e.to_string()))?
             .json()
-            .await?;
+            .await
+            .map_err(|e| self.redact(e.to_string()))?;
         if !resp.ok {
             log_err(&resp);
             return Ok(None);
@@ -122,9 +145,11 @@ impl TgClient {
             .post(self.url("answerCallbackQuery"))
             .json(&body)
             .send()
-            .await?
+            .await
+            .map_err(|e| self.redact(e.to_string()))?
             .json()
-            .await?;
+            .await
+            .map_err(|e| self.redact(e.to_string()))?;
         Ok(())
     }
 
@@ -134,15 +159,19 @@ impl TgClient {
             .post(self.url("deleteMessage"))
             .json(&json!({ "chat_id": chat_id, "message_id": message_id }))
             .send()
-            .await?
+            .await
+            .map_err(|e| self.redact(e.to_string()))?
             .json()
-            .await?;
+            .await
+            .map_err(|e| self.redact(e.to_string()))?;
         Ok(())
     }
 }
 
 fn log_err<T>(resp: &TgResponse<T>) {
     if let Some(desc) = &resp.description {
+        // Telegram's own error descriptions don't contain your token,
+        // so this one's safe to print as-is.
         eprintln!("Telegram API error: {desc}");
     }
 }

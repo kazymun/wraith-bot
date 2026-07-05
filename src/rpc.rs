@@ -104,4 +104,49 @@ impl SolanaRpc {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("could not fetch latest blockhash"))
     }
+
+    /// Returns (mint_authority_renounced, freeze_authority_renounced).
+    /// A live mint authority means the creator can print unlimited new
+    /// supply whenever they want; a live freeze authority means they can
+    /// freeze any holder's tokens. A renounced (null) authority on both is
+    /// one of the clearest "clean contract" checks experienced memecoin
+    /// traders do before entering - it doesn't guarantee safety, but a
+    /// live mint/freeze authority is close to a guaranteed rug vector.
+    pub async fn get_mint_authority_status(&self, mint: &str) -> Result<(bool, bool)> {
+        let result = self
+            .call("getAccountInfo", json!([mint, { "encoding": "jsonParsed" }]))
+            .await?;
+        let info = &result["value"]["data"]["parsed"]["info"];
+        let mint_renounced = info["mintAuthority"].is_null();
+        let freeze_renounced = info["freezeAuthority"].is_null();
+        Ok((mint_renounced, freeze_renounced))
+    }
+
+    /// Rough top-10-holder concentration as a % of total supply.
+    /// Caveat: this counts every largest account, including the liquidity
+    /// pool's own vault, so it reads artificially high right after launch
+    /// when most supply is still sitting in the pool. Treat it as a
+    /// directional "is this heavily wallet-concentrated" signal, not a
+    /// precise insider-holdings number.
+    pub async fn get_top10_concentration_pct(&self, mint: &str) -> Result<Option<f64>> {
+        let largest = self.call("getTokenLargestAccounts", json!([mint])).await?;
+        let accounts = largest["value"].as_array().cloned().unwrap_or_default();
+        if accounts.is_empty() {
+            return Ok(None);
+        }
+
+        let supply_result = self.call("getTokenSupply", json!([mint])).await?;
+        let total_supply = supply_result["value"]["uiAmount"].as_f64().unwrap_or(0.0);
+        if total_supply <= 0.0 {
+            return Ok(None);
+        }
+
+        let top10_sum: f64 = accounts
+            .iter()
+            .take(10)
+            .filter_map(|a| a["uiAmount"].as_f64())
+            .sum();
+
+        Ok(Some((top10_sum / total_supply) * 100.0))
+    }
 }

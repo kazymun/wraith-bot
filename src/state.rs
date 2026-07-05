@@ -1,19 +1,33 @@
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::EnvelopeSecret;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Awaiting {
     None,
-    SettingPin,
+    /// PIN is now mandatory at signup -- there is no "no PIN set, skip
+    /// the check" path anymore. A wallet cannot exist without a PIN
+    /// protecting it.
+    SettingPin { pending_wallet_secret_plain_b58: String },
     VerifyingPinForExport,
     VerifyingPinForWithdraw { dest: String, amount_sol: f64 },
+    /// User already typed+validated their new PIN (held here); we're now
+    /// waiting for their CURRENT PIN to authorize the change.
+    VerifyingPinForChangePin { new_pin: String },
+    /// Waiting for the user to type their desired new PIN, before we ask
+    /// them to confirm it with their current one.
+    EnteringNewPin,
+    VerifyingPinForImport { pending_key_b58: String },
+    /// No active trading session -- unlocking it (15 min) requires the PIN
+    /// once, then this buy proceeds automatically.
+    VerifyingPinForBuy { ca: String, amount_sol: f64 },
+    /// Same as above, for a sell.
+    VerifyingPinForSell { ca: String },
     EnteringBuyCA,
     EnteringSellCA,
     EnteringWithdrawAddress,
-    EnteringWithdrawPin, // legacy placeholder, unused directly
     EnteringRugScanCA,
     EnteringImportKey,
-    VerifyingPinForChangePin,
-    VerifyingPinForImport,
     EnteringCustomBuyAmount { ca: String },
 }
 
@@ -44,13 +58,55 @@ fn default_true() -> bool {
     true
 }
 
+/// Escalating lockout after repeated wrong PINs. Each failed attempt to
+/// decrypt (export, withdraw, change-pin) increments `failed_attempts`
+/// and sets `locked_until`. This is enforced in handlers.rs BEFORE ever
+/// calling `crypto.decrypt_with_pin` -- the lockout has to happen outside
+/// the crypto call, since the crypto call itself is the brute-force oracle.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PinLockout {
+    pub failed_attempts: u32,
+    pub locked_until: i64, // unix ts; 0 = not locked
+}
+
+impl PinLockout {
+    /// Returns seconds remaining locked, or 0 if not locked.
+    pub fn seconds_remaining(&self, now: i64) -> i64 {
+        (self.locked_until - now).max(0)
+    }
+
+    pub fn record_failure(&mut self, now: i64) {
+        self.failed_attempts += 1;
+        // Exponential backoff: 3 fails -> 30s, 4 -> 2min, 5 -> 15min,
+        // 6 -> 1hr, 7+ -> 24hr. Tune to taste but never let this hit 0
+        // again once failures start piling up.
+        let lock_secs: i64 = match self.failed_attempts {
+            0..=2 => 0,
+            3 => 30,
+            4 => 120,
+            5 => 900,
+            6 => 3_600,
+            _ => 86_400,
+        };
+        if lock_secs > 0 {
+            self.locked_until = now + lock_secs;
+        }
+    }
+
+    pub fn record_success(&mut self) {
+        self.failed_attempts = 0;
+        self.locked_until = 0;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub telegram_id: i64,
     pub pubkey: String,
-    pub enc_nonce: String,
-    pub enc_cipher: String,
-    pub pin_hash: Option<String>,
+    /// Envelope-encrypted private key. See crypto.rs -- this is useless
+    /// without both the server pepper AND the user's PIN.
+    pub secret: EnvelopeSecret,
+    pub pin_lockout: PinLockout,
     pub awaiting: Awaiting,
     pub slippage_bps: u32,
     pub positions: Vec<Position>,
@@ -59,16 +115,21 @@ pub struct UserRecord {
     pub created_at: i64,
     #[serde(default = "default_true")]
     pub gem_alerts: bool,
+    /// Addresses the user has previously withdrawn to. First-time
+    /// withdrawals to a NEW address get an extra confirmation + a short
+    /// mandatory delay -- see handlers.rs withdraw flow. This blunts
+    /// account-takeover drains and clipboard-hijack attacks.
+    #[serde(default)]
+    pub known_withdraw_addresses: Vec<String>,
 }
 
 impl UserRecord {
-    pub fn new(telegram_id: i64, pubkey: String, enc_nonce: String, enc_cipher: String, default_slippage_bps: u32) -> Self {
+    pub fn new(telegram_id: i64, pubkey: String, secret: EnvelopeSecret, default_slippage_bps: u32) -> Self {
         Self {
             telegram_id,
             pubkey,
-            enc_nonce,
-            enc_cipher,
-            pin_hash: None,
+            secret,
+            pin_lockout: PinLockout::default(),
             awaiting: Awaiting::None,
             slippage_bps: default_slippage_bps,
             positions: vec![],
@@ -76,6 +137,7 @@ impl UserRecord {
             refs: 0,
             created_at: chrono_now(),
             gem_alerts: true,
+            known_withdraw_addresses: vec![],
         }
     }
 }

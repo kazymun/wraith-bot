@@ -1,0 +1,333 @@
+    Checking wraith-bot v0.1.0 (/Users/allan/Desktop/wraith-bot 3)
+error[E0432]: unresolved import `crate::crypto::hash_pin`
+ --> src/handlers.rs:1:21
+  |
+1 | use crate::crypto::{hash_pin, Crypto};
+  |                     ^^^^^^^^ no `hash_pin` in `crypto`
+
+error[E0533]: expected unit struct, unit variant or constant, found struct variant `Awaiting::SettingPin`
+  --> src/handlers.rs:90:13
+   |
+90 |             Awaiting::SettingPin => {
+   |             ^^^^^^^^^^^^^^^^^^^^ not a unit struct, unit variant or constant
+   |
+help: the struct variant's field is being ignored
+   |
+90 |             Awaiting::SettingPin { pending_wallet_secret_plain_b58: _ } => {
+   |                                  ++++++++++++++++++++++++++++++++++++++
+
+error[E0533]: expected unit struct, unit variant or constant, found struct variant `Awaiting::VerifyingPinForChangePin`
+   --> src/handlers.rs:220:13
+    |
+220 |             Awaiting::VerifyingPinForChangePin => {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not a unit struct, unit variant or constant
+    |
+help: the struct variant's field is being ignored
+    |
+220 |             Awaiting::VerifyingPinForChangePin { new_pin: _ } => {
+    |                                                ++++++++++++++
+
+error[E0533]: expected unit struct, unit variant or constant, found struct variant `Awaiting::VerifyingPinForImport`
+   --> src/handlers.rs:230:13
+    |
+230 |             Awaiting::VerifyingPinForImport => {
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not a unit struct, unit variant or constant
+    |
+help: the struct variant's field is being ignored
+    |
+230 |             Awaiting::VerifyingPinForImport { pending_key_b58: _ } => {
+    |                                             ++++++++++++++++++++++
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+  --> src/handlers.rs:92:26
+   |
+92 |                     user.pin_hash = Some(hash_pin(&text));
+   |                          ^^^^^^^^ unknown field
+   |
+   = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+   --> src/handlers.rs:108:27
+    |
+108 |                     match wallet::export_private_key_b58(&self.crypto, &user) {
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^               ----- argument #2 of type `&str` is missing
+    |
+note: function defined here
+   --> src/wallet.rs:95:8
+    |
+95  | pub fn export_private_key_b58(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^                  ---------
+help: provide the argument
+    |
+108 -                     match wallet::export_private_key_b58(&self.crypto, &user) {
+108 +                     match wallet::export_private_key_b58(&self.crypto, /* &str */, &user) {
+    |
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+   --> src/handlers.rs:145:23
+    |
+145 |                 match wallet::import_encrypted_wallet(&self.crypto, &text) {
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^--------------------- argument #3 of type `&str` is missing
+    |
+note: function defined here
+   --> src/wallet.rs:56:8
+    |
+56  | pub fn import_encrypted_wallet(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+...
+59  |     private_key_b58: &str,
+    |     ---------------------
+help: provide the argument
+    |
+145 -                 match wallet::import_encrypted_wallet(&self.crypto, &text) {
+145 +                 match wallet::import_encrypted_wallet(&self.crypto, &text, /* &str */) {
+    |
+
+error[E0308]: mismatched types
+   --> src/handlers.rs:146:24
+    |
+145 |                 match wallet::import_encrypted_wallet(&self.crypto, &text) {
+    |                       ---------------------------------------------------- this expression has type `Result<(std::string::String, EnvelopeSecret), anyhow::Error>`
+146 |                     Ok((pubkey, nonce, cipher)) => {
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^ expected a tuple with 2 elements, found one with 3 elements
+    |
+    = note: expected tuple `(std::string::String, EnvelopeSecret)`
+               found tuple `(_, _, _)`
+
+error[E0609]: no field `enc_nonce` on type `UserRecord`
+   --> src/handlers.rs:148:30
+    |
+148 |                         user.enc_nonce = nonce;
+    |                              ^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0609]: no field `enc_cipher` on type `UserRecord`
+   --> src/handlers.rs:149:30
+    |
+149 |                         user.enc_cipher = cipher;
+    |                              ^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+   --> src/handlers.rs:178:25
+    |
+178 |                 if user.pin_hash.is_some() {
+    |                         ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0533]: expected value, found struct variant `Awaiting::SettingPin`
+   --> src/handlers.rs:222:37
+    |
+222 |                     user.awaiting = Awaiting::SettingPin;
+    |                                     ^^^^^^^^^^^^^^^^^^^^ not a value
+    |
+help: you might have meant to create a new value of the struct
+    |
+222 |                     user.awaiting = Awaiting::SettingPin { pending_wallet_secret_plain_b58: /* value */ };
+    |                                                          ++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+   --> src/handlers.rs:255:25
+    |
+255 |                 if user.pin_hash.is_none() {
+    |                         ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0533]: expected value, found struct variant `Awaiting::SettingPin`
+   --> src/handlers.rs:257:34
+    |
+257 |                     u.awaiting = Awaiting::SettingPin;
+    |                                  ^^^^^^^^^^^^^^^^^^^^ not a value
+    |
+help: you might have meant to create a new value of the struct
+    |
+257 |                     u.awaiting = Awaiting::SettingPin { pending_wallet_secret_plain_b58: /* value */ };
+    |                                                       ++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+   --> src/handlers.rs:408:25
+    |
+408 |                 if user.pin_hash.is_some() {
+    |                         ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+   --> src/handlers.rs:420:25
+    |
+420 |                 if user.pin_hash.is_some() {
+    |                         ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0533]: expected value, found struct variant `Awaiting::VerifyingPinForImport`
+   --> src/handlers.rs:421:37
+    |
+421 |                     user.awaiting = Awaiting::VerifyingPinForImport;
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not a value
+    |
+help: you might have meant to create a new value of the struct
+    |
+421 |                     user.awaiting = Awaiting::VerifyingPinForImport { pending_key_b58: /* value */ };
+    |                                                                     ++++++++++++++++++++++++++++++++
+
+error[E0609]: no field `pin_hash` on type `UserRecord`
+   --> src/handlers.rs:460:25
+    |
+460 |                 if user.pin_hash.is_some() {
+    |                         ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0533]: expected value, found struct variant `Awaiting::VerifyingPinForChangePin`
+   --> src/handlers.rs:461:37
+    |
+461 |                     user.awaiting = Awaiting::VerifyingPinForChangePin;
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not a value
+    |
+help: you might have meant to create a new value of the struct
+    |
+461 |                     user.awaiting = Awaiting::VerifyingPinForChangePin { new_pin: /* value */ };
+    |                                                                        ++++++++++++++++++++++++
+
+error[E0533]: expected value, found struct variant `Awaiting::SettingPin`
+   --> src/handlers.rs:465:37
+    |
+465 |                     user.awaiting = Awaiting::SettingPin;
+    |                                     ^^^^^^^^^^^^^^^^^^^^ not a value
+    |
+help: you might have meant to create a new value of the struct
+    |
+465 |                     user.awaiting = Awaiting::SettingPin { pending_wallet_secret_plain_b58: /* value */ };
+    |                                                          ++++++++++++++++++++++++++++++++++++++++++++++++
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+   --> src/handlers.rs:653:23
+    |
+653 |         let keypair = wallet::load_keypair(&self.crypto, user)?;
+    |                       ^^^^^^^^^^^^^^^^^^^^               ---- argument #2 of type `&str` is missing
+    |
+note: function defined here
+   --> src/wallet.rs:74:8
+    |
+74  | pub fn load_keypair(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<Keypair> {
+    |        ^^^^^^^^^^^^                  ---------
+help: provide the argument
+    |
+653 -         let keypair = wallet::load_keypair(&self.crypto, user)?;
+653 +         let keypair = wallet::load_keypair(&self.crypto, /* &str */, user)?;
+    |
+
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+   --> src/handlers.rs:682:23
+    |
+682 |         let keypair = wallet::load_keypair(&self.crypto, user)?;
+    |                       ^^^^^^^^^^^^^^^^^^^^               ---- argument #2 of type `&str` is missing
+    |
+note: function defined here
+   --> src/wallet.rs:74:8
+    |
+74  | pub fn load_keypair(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<Keypair> {
+    |        ^^^^^^^^^^^^                  ---------
+help: provide the argument
+    |
+682 -         let keypair = wallet::load_keypair(&self.crypto, user)?;
+682 +         let keypair = wallet::load_keypair(&self.crypto, /* &str */, user)?;
+    |
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> src/handlers.rs:35:39
+   |
+35 |         let (pubkey, nonce, cipher) = wallet::generate_encrypted_wallet(&self.crypto)?;
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-------------- argument #2 of type `&str` is missing
+   |
+note: function defined here
+  --> src/wallet.rs:48:8
+   |
+48 | pub fn generate_encrypted_wallet(crypto: &Crypto, pin: &str) -> Result<(String, crate::crypto::EnvelopeSecret)> {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^                  ---------
+help: provide the argument
+   |
+35 -         let (pubkey, nonce, cipher) = wallet::generate_encrypted_wallet(&self.crypto)?;
+35 +         let (pubkey, nonce, cipher) = wallet::generate_encrypted_wallet(&self.crypto, /* &str */)?;
+   |
+
+error[E0308]: mismatched types
+  --> src/handlers.rs:35:13
+   |
+35 |         let (pubkey, nonce, cipher) = wallet::generate_encrypted_wallet(&self.crypto)?;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^   ------------------------------------------------ this expression has type `(std::string::String, EnvelopeSecret)`
+   |             |
+   |             expected a tuple with 2 elements, found one with 3 elements
+   |
+   = note: expected tuple `(std::string::String, EnvelopeSecret)`
+              found tuple `(_, _, _)`
+
+error[E0061]: this function takes 4 arguments but 5 arguments were supplied
+   --> src/handlers.rs:36:20
+    |
+36  |         let user = UserRecord::new(telegram_id, pubkey, nonce, cipher, self.default_slippage_bps);
+    |                    ^^^^^^^^^^^^^^^                                     ------------------------- unexpected argument #5 of type `u32`
+    |
+note: associated function defined here
+   --> src/state.rs:117:12
+    |
+117 |     pub fn new(telegram_id: i64, pubkey: String, secret: EnvelopeSecret, default_slippage_bps: u32) -> Self {
+    |            ^^^
+help: remove the extra argument
+    |
+36  -         let user = UserRecord::new(telegram_id, pubkey, nonce, cipher, self.default_slippage_bps);
+36  +         let user = UserRecord::new(telegram_id, pubkey, nonce, cipher);
+    |
+
+error[E0609]: no field `pin_hash` on type `&UserRecord`
+   --> src/handlers.rs:987:17
+    |
+987 |     match &user.pin_hash {
+    |                 ^^^^^^^^ unknown field
+    |
+    = note: available fields are: `telegram_id`, `pubkey`, `secret`, `pin_lockout`, `awaiting` ... and 7 others
+
+error[E0609]: no field `master_key_b64` on type `config::Config`
+  --> src/main.rs:28:34
+   |
+28 |         crypto: Crypto::new(&cfg.master_key_b64)?,
+   |                                  ^^^^^^^^^^^^^^ unknown field
+   |
+   = note: available fields are: `telegram_token`, `rpc_url`, `pepper_b64`, `db_path`, `default_slippage_bps` ... and 2 others
+
+error[E0509]: cannot move out of type `Wallet`, which implements the `Drop` trait
+  --> src/wallet.rs:51:9
+   |
+51 |     Ok((wallet.address, secret))
+   |         ^^^^^^^^^^^^^^
+   |         |
+   |         cannot move out of here
+   |         move occurs because `wallet.address` has type `std::string::String`, which does not implement the `Copy` trait
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+51 |     Ok((wallet.address.clone(), secret))
+   |                       ++++++++
+
+error[E0509]: cannot move out of type `Wallet`, which implements the `Drop` trait
+  --> src/wallet.rs:63:9
+   |
+63 |     Ok((wallet.address, secret))
+   |         ^^^^^^^^^^^^^^
+   |         |
+   |         cannot move out of here
+   |         move occurs because `wallet.address` has type `std::string::String`, which does not implement the `Copy` trait
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+63 |     Ok((wallet.address.clone(), secret))
+   |                       ++++++++
+
+Some errors have detailed explanations: E0061, E0308, E0432, E0509, E0533, E0609.
+For more information about an error, try `rustc --explain E0061`.
+error: could not compile `wraith-bot` (bin "wraith-bot") due to 29 previous errors
