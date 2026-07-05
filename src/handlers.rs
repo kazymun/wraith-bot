@@ -1085,14 +1085,12 @@ impl App {
                 watch.alerted_curve = true;
                 let _ = self.db.save_pump_watch(&data.mint, &watch);
 
-                let pct = (data.v_sol_in_bonding_curve / MIGRATION_SOL_APPROX_FOR_DISPLAY * 100.0).min(100.0);
-                let msg = format!(
-                    "👀 <b>Early Watch — Pump.fun</b>\n\n🪙 <b>{} (${})</b>\n📋 <code>{}</code>\n📈 Bonding curve: ~{pct:.0}% toward migration\n\n⚠️ Still pre-migration — <b>not buyable through this bot yet</b>. Worth watching; a migration alert will follow if it graduates.",
-                    if watch.name.is_empty() { "Unknown" } else { &watch.name },
-                    if watch.symbol.is_empty() { "???" } else { &watch.symbol },
-                    data.mint,
-                );
-                self.broadcast_to_gem_alert_subscribers(&msg, None).await;
+                // Spawn so an on-chain lookup for one token never delays
+                // processing of the next PumpPortal event in the stream.
+                let app = self.clone();
+                tokio::spawn(async move {
+                    app.alert_if_worthy_curve(data, watch).await;
+                });
             }
 
             PumpEvent::Migrated(data) => {
@@ -1109,24 +1107,98 @@ impl App {
                 watch.alerted_migration = true;
                 let _ = self.db.save_pump_watch(&data.mint, &watch);
 
-                let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
-                let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
-                let name_esc = crate::telegram::escape_html(&name);
-                let symbol_esc = crate::telegram::escape_html(&symbol);
-                let msg = format!(
-                    "🚀 <b>Just Migrated!</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n\nGraduated from the pump.fun bonding curve to a real trading pool — demand pushed it all the way through. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — migration doesn't guarantee it holds.</i>",
-                    data.mint,
-                );
-                let kb = vec![
-                    vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("bcp_{}", data.mint))],
-                    vec![crate::telegram::btn("❌ Skip", "main")],
-                ];
-                self.broadcast_to_gem_alert_subscribers(&msg, Some(kb)).await;
+                // Same reasoning -- DexScreener lookups + retries can take
+                // a few seconds, so don't block the event loop on them.
+                let app = self.clone();
+                tokio::spawn(async move {
+                    app.alert_if_worthy_migration(data, watch).await;
+                });
             }
         }
     }
 
-    async fn broadcast_to_gem_alert_subscribers(&self, msg: &str, kb: Option<Vec<Vec<crate::telegram::InlineButton>>>) {
+    /// Minimum Gem Scanner score (same 0-100 scale as the AI Gem Scanner
+    /// button) a just-migrated token must clear before we alert on it.
+    /// 60 lines up with the "MODERATE" tier and above -- raise this if
+    /// you still see too many weak alerts, lower it if you want more
+    /// volume at the cost of quality.
+    const MIGRATION_ALERT_MIN_SCORE: i32 = 60;
+
+    /// Pre-migration tokens have no DexScreener listing yet, so the only
+    /// signal available is on-chain: skip anything whose creator can
+    /// still mint unlimited new supply or freeze holder wallets. That's
+    /// the single biggest rug vector and cheap to check before ever
+    /// pinging anyone about a token that isn't even tradeable yet.
+    async fn alert_if_worthy_curve(&self, data: crate::pumpportal::TokenData, watch: crate::db::PumpWatch) {
+        match self.rpc.get_mint_authority_status(&data.mint).await {
+            Ok((mint_ok, freeze_ok)) if mint_ok && freeze_ok => {}
+            _ => return, // still has an active mint/freeze authority, or RPC couldn't tell -- skip
+        }
+
+        let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
+        let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
+        let name_esc = crate::telegram::escape_html(&name);
+        let symbol_esc = crate::telegram::escape_html(&symbol);
+        let pct = (data.v_sol_in_bonding_curve / MIGRATION_SOL_APPROX_FOR_DISPLAY * 100.0).min(100.0);
+        let msg = format!(
+            "👀 <b>Early Watch — Pump.fun</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n📈 Bonding curve: ~{pct:.0}% toward migration\n✅ Mint & freeze authority renounced\n\n⚠️ Still pre-migration — <b>not buyable through this bot yet</b>. A migration alert will follow if it graduates and clears our quality bar.",
+            data.mint,
+        );
+        self.broadcast_to_gem_alert_subscribers(&msg, None).await;
+    }
+
+    /// Only alerts on a migration if it actually clears a real quality
+    /// bar -- the same DexScreener + on-chain scoring the AI Gem Scanner
+    /// uses, not just "a pool exists now". Most migrations are noise;
+    /// this cuts it down to the ones worth a trader's attention.
+    async fn alert_if_worthy_migration(&self, data: crate::pumpportal::TokenData, watch: crate::db::PumpWatch) {
+        // DexScreener can take a few seconds to index a brand-new pool
+        // right after migration -- retry briefly instead of giving up
+        // (and staying silent) on the very first miss.
+        let mut pair = None;
+        for _ in 0..5 {
+            pair = dexscreener::get_token_pair(&data.mint).await.ok().flatten();
+            if pair.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let Some(pair) = pair else {
+            // Can't verify quality yet -- stay quiet rather than alert blind.
+            return;
+        };
+
+        let mut signal = dexscreener::score_gem(&pair, None);
+        self.apply_onchain_checks(&data.mint, &mut signal).await;
+
+        if signal.score < Self::MIGRATION_ALERT_MIN_SCORE {
+            return;
+        }
+
+        let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
+        let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
+        let name_esc = crate::telegram::escape_html(&name);
+        let symbol_esc = crate::telegram::escape_html(&symbol);
+        let top_notes = if signal.notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n{}",
+                signal.notes.iter().take(3).map(|n| crate::telegram::escape_html(n)).collect::<Vec<_>>().join(" | ")
+            )
+        };
+        let msg = format!(
+            "🚀 <b>Just Migrated — Worth A Look</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n🤖 Score: {}/100 — {}{top_notes}\n\nGraduated from the pump.fun bonding curve to a real trading pool. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — a good score doesn't guarantee it holds.</i>",
+            data.mint, signal.score, signal.tier,
+        );
+        let kb = vec![
+            vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("bcp_{}", data.mint))],
+            vec![crate::telegram::btn("❌ Skip", "main")],
+        ];
+        self.broadcast_to_gem_alert_subscribers(&msg, Some(kb)).await;
+    }
+
+(&self, msg: &str, kb: Option<Vec<Vec<crate::telegram::InlineButton>>>) {
         for item in self.db.inner_iter() {
             if let Ok((_, bytes)) = item {
                 if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
