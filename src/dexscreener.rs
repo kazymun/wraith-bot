@@ -160,7 +160,7 @@ pub fn score_gem(pair: &Value, prev: Option<&Snapshot>) -> GemSignal {
 
     if age_hours < 1.0 && liq > 8_000.0 {
         score += 20;
-        notes.push("🆕 Brand new (<1h) with real liquidity".to_string());
+        notes.push("🆕 Brand new (under 1h) with real liquidity".to_string());
     } else if age_hours < 6.0 {
         score += 12;
         notes.push("🆕 Very early (<6h)".to_string());
