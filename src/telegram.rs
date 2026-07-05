@@ -175,3 +175,18 @@ fn log_err<T>(resp: &TgResponse<T>) {
         eprintln!("Telegram API error: {desc}");
     }
 }
+
+/// Escapes text that will be interpolated into a `parse_mode: HTML` message
+/// but did NOT originate from our own hardcoded strings -- e.g. token
+/// names/symbols pulled from DexScreener or PumpPortal. Telegram's HTML
+/// parser treats bare `<`, `>`, and `&` as the start of markup; a token
+/// name containing any of these (extremely common with meme coins doing
+/// things like "APE<>DOGE") breaks the parser and the ENTIRE message --
+/// including any inline keyboard/buttons attached to it -- silently fails
+/// to send. Always wrap untrusted text with this before formatting it into
+/// an HTML message. Do NOT use this on strings we already hand-wrote with
+/// intentional tags like <b>/<code>/<i> -- only on the untrusted values
+/// substituted into them.
+pub fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}

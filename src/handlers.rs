@@ -778,8 +778,8 @@ impl App {
             ("LIKELY RUG", "🚨")
         };
 
-        let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
-        let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
+        let name = crate::telegram::escape_html(pair["baseToken"]["name"].as_str().unwrap_or("Unknown"));
+        let symbol = crate::telegram::escape_html(pair["baseToken"]["symbol"].as_str().unwrap_or("???"));
         let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
         let liq = pair["liquidity"]["usd"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
         let price = pair["priceUsd"].as_str().unwrap_or("N/A");
@@ -1104,8 +1104,10 @@ impl App {
 
                 let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
                 let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
+                let name_esc = crate::telegram::escape_html(&name);
+                let symbol_esc = crate::telegram::escape_html(&symbol);
                 let msg = format!(
-                    "🚀 <b>Just Migrated!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{}</code>\n\nGraduated from the pump.fun bonding curve to a real trading pool — demand pushed it all the way through. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — migration doesn't guarantee it holds.</i>",
+                    "🚀 <b>Just Migrated!</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n\nGraduated from the pump.fun bonding curve to a real trading pool — demand pushed it all the way through. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — migration doesn't guarantee it holds.</i>",
                     data.mint,
                 );
                 let kb = vec![
@@ -1171,6 +1173,8 @@ impl App {
 
                 let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
                 let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
+                let name_esc = crate::telegram::escape_html(name);
+                let symbol_esc = crate::telegram::escape_html(symbol);
                 let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
                 let liq_disp = fmt_usd(liq);
                 let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
@@ -1178,7 +1182,7 @@ impl App {
                 let notes = signal.notes.iter().take(4).map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n");
 
                 let msg = format!(
-                    "💎 <b>{fresh_tag}Gem Alert!</b>\n\n🪙 <b>{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq_disp} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}\n{notes}\n\n<i>Tap buy to trade instantly 👇</i>",
+                    "💎 <b>{fresh_tag}Gem Alert!</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq_disp} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}\n{notes}\n\n<i>Tap buy to trade instantly 👇</i>",
                     signal.score, signal.tier
                 );
                 let kb = vec![
@@ -1289,6 +1293,8 @@ impl App {
         for (pair, signal) in gems.iter().take(5) {
             let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
             let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
+            let name_esc = crate::telegram::escape_html(name);
+            let symbol_esc = crate::telegram::escape_html(symbol);
             let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
             let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
             let liq = pair["liquidity"]["usd"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
@@ -1299,7 +1305,7 @@ impl App {
             };
 
             msg += &format!(
-                "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name} (${symbol})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}{top_note}\n\n",
+                "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name_esc} (${symbol_esc})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}{top_note}\n\n",
                 signal.score, signal.tier
             );
         }
@@ -1328,7 +1334,7 @@ impl App {
         }
         let mut msg = "📊 <b>Live Solana Signals</b>\n\n".to_string();
         for p in &pairs {
-            let symbol = p["baseToken"]["symbol"].as_str().unwrap_or("???");
+            let symbol = crate::telegram::escape_html(p["baseToken"]["symbol"].as_str().unwrap_or("???"));
             let change1h = p["priceChange"]["h1"].as_f64().unwrap_or(0.0);
             let mc = p["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
             msg += &format!("• <b>{symbol}</b> {change1h:.1}% (1h) | MC: {mc}\n");
