@@ -34,6 +34,33 @@ async fn main() -> anyhow::Result<()> {
         cfg.min_pin_length,
     );
 
+    // Verify the platform fee wallet's wrapped-SOL token account actually
+    // exists on-chain. This is the #1 cause of "fees worked once, then
+    // stopped": Jupiter needs a pre-existing token account to deliver the
+    // platform fee into, and does not create one for you as a side effect
+    // of the swap. If this account was never created -- or was created
+    // then later closed by unwrapping/withdrawing everything out of it in
+    // a wallet app -- every single trade will silently collect $0 in fees
+    // even though `platformFeeBps` is set on every quote.
+    if !cfg.fee_wallet.is_empty() {
+        match jupiter::derive_wsol_fee_account(&cfg.fee_wallet) {
+            Ok(fee_ata) => match app.rpc.get_account_exists(&fee_ata).await {
+                Ok(true) => println!("✅ Fee wallet WSOL account exists ({fee_ata}) — platform fees can be collected."),
+                Ok(false) => eprintln!(
+                    "🚨 Fee wallet WSOL account ({fee_ata}) does NOT exist on-chain yet! \
+                     Every buy/sell will silently collect $0 in platform fees until this \
+                     account is created. Create it once with `spl-token create-account \
+                     So11111111111111111111111111111111111111112 --owner {}` (or any \
+                     'wrap SOL' action pointed at that owner), then restart the bot. \
+                     Also make sure nothing ever fully unwraps/closes this account again.",
+                    cfg.fee_wallet
+                ),
+                Err(e) => eprintln!("⚠️ Couldn't verify fee wallet WSOL account ({fee_ata}): {e:?}"),
+            },
+            Err(e) => eprintln!("⚠️ FEE_WALLET is set but invalid: {e}"),
+        }
+    }
+
     println!("👻 Wraith bot is running...");
 
     // Spawn background gem scanner (DexScreener-based)

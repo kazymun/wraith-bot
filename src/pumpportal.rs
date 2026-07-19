@@ -10,7 +10,7 @@ const PUMPPORTAL_WS: &str = "wss://pumpportal.fun/api/data";
 /// slightly in practice, ~85 SOL is the commonly cited figure). We use this
 /// only to compute a rough "% of the way to migration" -- it's a heuristic,
 /// not an exact on-chain constant, so don't treat it as gospel.
-const MIGRATION_SOL_APPROX: f64 = 85.0;
+pub const MIGRATION_SOL_APPROX: f64 = 85.0;
 const CURVE_WATCH_THRESHOLD_PCT: f64 = 0.30;
 
 #[derive(Debug, Clone)]

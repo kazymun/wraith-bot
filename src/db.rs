@@ -18,15 +18,35 @@ pub struct GemSnapshot {
 
 /// Tracks a token we first heard about from the PumpPortal WebSocket feed
 /// (i.e. at or near creation, before it ever has a DexScreener listing).
-/// Persisted so alert dedup survives restarts, same reasoning as GemSnapshot.
+/// Persisted so this survives restarts and so the AI Gem Scanner can score
+/// pump.fun tokens (pre- and post-migration) on demand instead of us
+/// broadcasting an alert for every single one as it happens.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PumpWatch {
+    #[serde(default)]
+    pub mint: String,
     pub name: String,
     pub symbol: String,
     pub first_seen: i64,
-    /// Already sent the "crossing 30% of the bonding curve" watch alert.
+    /// Rough % of the way to migration (v_sol_in_bonding_curve / ~85 SOL),
+    /// refreshed on every CurveProgress event we see for this mint.
+    #[serde(default)]
+    pub last_curve_pct: f64,
+    /// Cached "mint authority AND freeze authority both renounced" check,
+    /// refreshed alongside `last_curve_pct` -- avoids an RPC round-trip
+    /// per token every time someone runs the AI Gem Scanner.
+    #[serde(default)]
+    pub authorities_ok: Option<bool>,
+    #[serde(default)]
+    pub migrated: bool,
+    #[serde(default)]
+    pub migrated_at: i64,
+    /// Legacy fields from when we used to broadcast a message per event --
+    /// no longer used to gate anything, kept only so old records on disk
+    /// still deserialize cleanly.
+    #[serde(default)]
     pub alerted_curve: bool,
-    /// Already sent the "just migrated, now tradeable" alert.
+    #[serde(default)]
     pub alerted_migration: bool,
 }
 

@@ -21,10 +21,18 @@ pub enum Awaiting {
     /// No active trading session -- unlocking it (15 min) requires the PIN
     /// once, then this buy proceeds automatically.
     VerifyingPinForBuy { ca: String, amount_sol: f64 },
-    /// Same as above, for a sell.
-    VerifyingPinForSell { ca: String },
+    /// Same as above, for a sell. `pct` (1-100) is how much of the current
+    /// token balance to sell -- selected before the PIN prompt via the
+    /// percentage keyboard (or a custom typed value).
+    VerifyingPinForSell { ca: String, pct: u8 },
     EnteringBuyCA,
+    /// Waiting for a CA *or* a coin name/symbol to sell -- resolved against
+    /// the user's own open positions first, then DexScreener search, before
+    /// showing the sell-percentage keyboard.
     EnteringSellCA,
+    /// User tapped "✏️ Custom %" on the sell-percentage keyboard; waiting
+    /// for them to type a number 1-100.
+    EnteringCustomSellPercent { ca: String },
     EnteringWithdrawAddress,
     EnteringRugScanCA,
     EnteringImportKey,

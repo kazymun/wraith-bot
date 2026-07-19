@@ -24,6 +24,24 @@ const TRADING_SESSION_SECS: i64 = 15 * 60;
 /// human-readable "~X% toward migration" display in watch alerts.
 const MIGRATION_SOL_APPROX_FOR_DISPLAY: f64 = 85.0;
 
+/// One scannable candidate for the AI Gem Scanner, whichever source it
+/// came from -- lets DexScreener-based gems and pump.fun (pre/post-
+/// migration) candidates get merged, sorted, and rendered as a single
+/// consistent list.
+struct GemEntry {
+    ca: String,
+    name: String,
+    symbol: String,
+    score: i32,
+    tier: &'static str,
+    notes: Vec<String>,
+    mc: Option<f64>,
+    liq: Option<f64>,
+    change1h: Option<f64>,
+    is_fresh: bool,
+    pre_migration: bool,
+}
+
 /// In-memory-only cache of a decrypted keypair, so a user who already
 /// entered their PIN once doesn't get asked again on every single trade.
 /// NEVER written to disk, wiped on process restart, and zeroized on drop.
@@ -424,7 +442,20 @@ impl App {
             Awaiting::EnteringSellCA => {
                 user.awaiting = Awaiting::None;
                 self.db.save_user(&user)?;
-                self.handle_sell_ca(chat_id, telegram_id, &text).await?;
+                self.handle_sell_query(chat_id, &user, &text).await?;
+            }
+
+            Awaiting::EnteringCustomSellPercent { ca } => {
+                user.awaiting = Awaiting::None;
+                self.db.save_user(&user)?;
+                match text.trim_end_matches('%').parse::<f64>() {
+                    Ok(pct) if pct > 0.0 && pct <= 100.0 => {
+                        self.handle_sell_pct(chat_id, telegram_id, &ca, pct.round() as u8).await?;
+                    }
+                    _ => {
+                        self.tg.send_html(chat_id, "❌ Invalid percentage. Enter a number between 1 and 100, e.g. <code>40</code>", Some(kb::main_only())).await?;
+                    }
+                }
             }
 
             Awaiting::EnteringRugScanCA => {
@@ -465,7 +496,7 @@ impl App {
                 }
             }
 
-            Awaiting::VerifyingPinForSell { ca } => {
+            Awaiting::VerifyingPinForSell { ca, pct } => {
                 if let Some(m) = lockout_message(&user) {
                     self.tg.send_html(chat_id, &m, None).await?;
                     return Ok(());
@@ -475,7 +506,7 @@ impl App {
                         user.awaiting = Awaiting::None;
                         self.db.save_user(&user)?;
                         self.store_session(telegram_id, &kp);
-                        self.execute_sell(chat_id, &mut user, &kp, &ca).await?;
+                        self.execute_sell(chat_id, &mut user, &kp, &ca, pct).await?;
                     }
                     None => {
                         self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
@@ -518,7 +549,7 @@ impl App {
             }
             "/help" => {
                 self.tg.send_html(chat_id,
-                    "👻 <b>Wraith Commands</b>\n\n/start — Main menu\n/buy — Buy a token\n/sell — Sell a token\n/balance — Check balance\n/cancel — Cancel current action\n/help — This message",
+                    "👻 <b>Wraith Commands</b>\n\n/start — Main menu\n/buy — Buy a token (CA or name)\n/sell — Sell a token\n/positions — Open positions\n/pnl — P/L summary\n/gemscan — AI Gem Scanner\n/balance — Check balance\n/cancel — Cancel current action\n/help — This message",
                     None,
                 ).await?;
             }
@@ -526,13 +557,10 @@ impl App {
                 let mut u = self.get_or_create_user(telegram_id)?;
                 u.awaiting = Awaiting::EnteringBuyCA;
                 self.db.save_user(&u)?;
-                self.tg.send_html(chat_id, "🟢 <b>Buy Token</b>\n\nPaste the contract address (CA):", Some(kb::cancel_to("main"))).await?;
+                self.tg.send_html(chat_id, "🟢 <b>Buy Token</b>\n\nPaste the contract address (CA), or type the coin's name/symbol:", Some(kb::cancel_to("main"))).await?;
             }
             "/sell" => {
-                let mut u = self.get_or_create_user(telegram_id)?;
-                u.awaiting = Awaiting::EnteringSellCA;
-                self.db.save_user(&u)?;
-                self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nPaste the CA to sell:", Some(kb::cancel_to("main"))).await?;
+                self.start_sell_flow(chat_id, telegram_id).await?;
             }
             "/balance" => {
                 let user = self.get_or_create_user(telegram_id)?;
@@ -541,6 +569,12 @@ impl App {
             }
             "/pnl" => {
                 self.handle_pnl(chat_id, telegram_id).await?;
+            }
+            "/positions" => {
+                self.handle_positions(chat_id, telegram_id).await?;
+            }
+            "/gemscan" | "/scan" => {
+                self.handle_gem_scan(chat_id).await?;
             }
             _ => {}
         }
@@ -575,75 +609,13 @@ impl App {
             "buy" => {
                 user.awaiting = Awaiting::EnteringBuyCA;
                 self.db.save_user(&user)?;
-                self.tg.send_html(chat_id, "🟢 <b>Buy Token</b>\n\nPaste the contract address (CA):", Some(kb::cancel_to("main"))).await?;
+                self.tg.send_html(chat_id, "🟢 <b>Buy Token</b>\n\nPaste the contract address (CA), or type the coin's name/symbol:", Some(kb::cancel_to("main"))).await?;
             }
             "sell" => {
-                user.awaiting = Awaiting::EnteringSellCA;
-                self.db.save_user(&user)?;
-                self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nPaste the CA to sell:", Some(kb::cancel_to("main"))).await?;
+                self.start_sell_flow(chat_id, telegram_id).await?;
             }
             "positions" => {
-                if user.positions.is_empty() {
-                    self.tg.send_html(chat_id, "📊 <b>Open Positions</b>\n\nNo open positions yet.", Some(kb::main_only())).await?;
-                } else {
-                    self.tg.send_html(chat_id, "📊 Fetching live prices...", None).await?;
-
-                    let sol_handle = tokio::spawn(async {
-                        dexscreener::get_token_pair(SOL_MINT)
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|p| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()))
-                            .unwrap_or(0.0)
-                    });
-
-                    let mut set = tokio::task::JoinSet::new();
-                    for (i, p) in user.positions.iter().enumerate() {
-                        let mint = p.mint.clone();
-                        set.spawn(async move {
-                            let price = dexscreener::get_token_pair(&mint)
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|pair| pair["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()));
-                            (i, price)
-                        });
-                    }
-                    let mut prices: Vec<Option<f64>> = vec![None; user.positions.len()];
-                    while let Some(res) = set.join_next().await {
-                        if let Ok((i, price)) = res {
-                            prices[i] = price;
-                        }
-                    }
-                    let sol_price_usd = sol_handle.await.unwrap_or(0.0);
-
-                    let mut msg = "📊 <b>Open Positions</b>\n\n".to_string();
-                    for (i, p) in user.positions.iter().enumerate() {
-                        let current_price_usd = prices[i];
-
-                        match current_price_usd {
-                            Some(cur) if p.entry_price_usd > 0.0 => {
-                                let pct = (cur / p.entry_price_usd - 1.0) * 100.0;
-                                let entry_value_usd = p.tokens_received_est * p.entry_price_usd;
-                                let current_value_usd = p.tokens_received_est * cur;
-                                let pl_usd = current_value_usd - entry_value_usd;
-                                let pl_sol = if sol_price_usd > 0.0 { pl_usd / sol_price_usd } else { 0.0 };
-                                let arrow = if pct >= 0.0 { "🟢" } else { "🔴" };
-                                msg += &format!(
-                                    "{arrow} <b>{}</b>\n   Entry: ${:.8} → Now: ${:.8} ({pct:+.1}%)\n   P/L: {pl_sol:+.4} SOL (${pl_usd:+.2})\n\n",
-                                    p.symbol, p.entry_price_usd, cur
-                                );
-                            }
-                            _ => {
-                                msg += &format!(
-                                    "⚪ <b>{}</b> — spent {:.4} SOL, ~{:.2} tokens (live price unavailable)\n\n",
-                                    p.symbol, p.sol_spent, p.tokens_received_est
-                                );
-                            }
-                        }
-                    }
-                    self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
-                }
+                self.handle_positions(chat_id, telegram_id).await?;
             }
             "withdraw" => {
                 let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
@@ -725,6 +697,22 @@ impl App {
                     self.handle_buy_amount(chat_id, telegram_id, other).await?;
                 }
             }
+            other if other.starts_with("sellsel_") => {
+                let ca = other.trim_start_matches("sellsel_");
+                let label = user.positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(ca));
+                self.tg.send_html(chat_id, &format!("🔴 <b>Sell {label}</b>\n\nHow much do you want to sell?"), Some(kb::sell_percent_menu(ca))).await?;
+            }
+            other if other.starts_with("sellpct_") => {
+                let rest = other.trim_start_matches("sellpct_");
+                let Some((ca, pct_str)) = rest.rsplit_once('_') else { return Ok(()); };
+                if pct_str == "custom" {
+                    user.awaiting = Awaiting::EnteringCustomSellPercent { ca: ca.to_string() };
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "✏️ What percentage do you want to sell? (1-100, e.g. <code>40</code>):", Some(kb::cancel_to("main"))).await?;
+                } else if let Ok(pct) = pct_str.parse::<u8>() {
+                    self.handle_sell_pct(chat_id, telegram_id, ca, pct).await?;
+                }
+            }
             other if other.starts_with("slip_") => {
                 if let Ok(bps) = other.trim_start_matches("slip_").parse::<u32>() {
                     user.slippage_bps = bps;
@@ -737,7 +725,183 @@ impl App {
         Ok(())
     }
 
-    async fn handle_buy_ca(&self, chat_id: i64, ca: &str) -> Result<()> {
+    /// True if `s` looks like a Solana base58 public key (a CA), rather
+    /// than a coin name/symbol someone typed to search for. Real addresses
+    /// are base58, 32-44 chars, and decode to a valid Pubkey; anything else
+    /// (spaces, punctuation, wrong length) is treated as a search query.
+    fn looks_like_ca(s: &str) -> bool {
+        let s = s.trim();
+        (32..=44).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric()) && Pubkey::from_str(s).is_ok()
+    }
+
+    /// Resolves free-typed user input (a pasted CA, or a coin name/symbol)
+    /// to a concrete contract address. If it already looks like a CA, use
+    /// it as-is. Otherwise searches DexScreener by name/symbol and picks
+    /// the highest-liquidity match, since that's overwhelmingly the "real"
+    /// token when a name is shared by low-liquidity scam clones.
+    async fn resolve_token_query(&self, chat_id: i64, input: &str) -> Result<Option<String>> {
+        let input = input.trim();
+        if Self::looks_like_ca(input) {
+            return Ok(Some(input.to_string()));
+        }
+        let results = dexscreener::search_tokens(input).await.unwrap_or_default();
+        let Some(top) = results.first() else {
+            self.tg.send_html(
+                chat_id,
+                &format!(
+                    "❌ Couldn't find a token matching \"{}\". Try pasting the contract address (CA) instead.",
+                    crate::telegram::escape_html(input)
+                ),
+                Some(kb::main_only()),
+            ).await?;
+            return Ok(None);
+        };
+        let ca = top["baseToken"]["address"].as_str().unwrap_or("").to_string();
+        if ca.is_empty() {
+            return Ok(None);
+        }
+        let name = crate::telegram::escape_html(top["baseToken"]["name"].as_str().unwrap_or("Unknown"));
+        let symbol = crate::telegram::escape_html(top["baseToken"]["symbol"].as_str().unwrap_or("???"));
+        self.tg.send_html(
+            chat_id,
+            &format!("🔎 Matched \"{}\" → <b>{name} (${symbol})</b>\n<code>{ca}</code>", crate::telegram::escape_html(input)),
+            None,
+        ).await?;
+        Ok(Some(ca))
+    }
+
+    /// Same idea as `resolve_token_query`, but for sells: checks the
+    /// user's own open positions by symbol first (so "sell bonk" always
+    /// hits the exact mint they actually bought, not a same-named clone
+    /// DexScreener happens to rank higher), then falls back to the same
+    /// name search.
+    async fn resolve_sell_query(&self, chat_id: i64, user: &UserRecord, input: &str) -> Result<Option<String>> {
+        let input = input.trim();
+        if Self::looks_like_ca(input) {
+            return Ok(Some(input.to_string()));
+        }
+        if let Some(p) = user.positions.iter().find(|p| p.symbol.eq_ignore_ascii_case(input)) {
+            return Ok(Some(p.mint.clone()));
+        }
+        self.resolve_token_query(chat_id, input).await
+    }
+
+    /// Entry point for the "Sell" button / `/sell` command: shows a
+    /// one-tap picker of the user's current holdings if they have any,
+    /// otherwise falls back to asking for a CA/name to type.
+    async fn start_sell_flow(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
+        let mut user = self.get_or_create_user(telegram_id)?;
+        if user.positions.is_empty() {
+            user.awaiting = Awaiting::EnteringSellCA;
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nYou don't have any tracked positions, but you can still sell any token in your wallet. Paste the CA, or type the coin's name/symbol:", Some(kb::cancel_to("main"))).await?;
+        } else {
+            user.awaiting = Awaiting::EnteringSellCA;
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nPick a position below, or type a CA/coin name:", Some(kb::position_list(&user.positions))).await?;
+        }
+        Ok(())
+    }
+
+    /// Handles typed input (CA or coin name) while `Awaiting::EnteringSellCA`
+    /// -- resolves it, then shows the sell-percentage keyboard rather than
+    /// selling immediately.
+    async fn handle_sell_query(&self, chat_id: i64, user: &UserRecord, input: &str) -> Result<()> {
+        let Some(ca) = self.resolve_sell_query(chat_id, user, input).await? else { return Ok(()); };
+        let label = user.positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(&ca));
+        self.tg.send_html(chat_id, &format!("🔴 <b>Sell {label}</b>\n\nHow much do you want to sell?"), Some(kb::sell_percent_menu(&ca))).await?;
+        Ok(())
+    }
+
+    /// Kicks off (or PIN-gates) a sell for `pct`% of the user's current
+    /// balance of `ca`, once a percentage has been chosen.
+    async fn handle_sell_pct(&self, chat_id: i64, telegram_id: i64, ca: &str, pct: u8) -> Result<()> {
+        let mut user = self.get_or_create_user(telegram_id)?;
+        if let Some(kp) = self.session_keypair(telegram_id) {
+            self.execute_sell(chat_id, &mut user, &kp, ca, pct).await?;
+        } else {
+            if let Some(m) = lockout_message(&user) {
+                self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
+                return Ok(());
+            }
+            user.awaiting = Awaiting::VerifyingPinForSell { ca: ca.to_string(), pct };
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔑 Enter your PIN to unlock trading (stays unlocked for 15 minutes):", Some(kb::cancel_to("main"))).await?;
+        }
+        Ok(())
+    }
+
+    /// Shared body for the "📊 Positions" button and the `/positions`
+    /// command.
+    async fn handle_positions(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
+        let user = self.get_or_create_user(telegram_id)?;
+        if user.positions.is_empty() {
+            self.tg.send_html(chat_id, "📊 <b>Open Positions</b>\n\nNo open positions yet.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+        self.tg.send_html(chat_id, "📊 Fetching live prices...", None).await?;
+
+        let sol_handle = tokio::spawn(async {
+            dexscreener::get_token_pair(SOL_MINT)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| p["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()))
+                .unwrap_or(0.0)
+        });
+
+        let mut set = tokio::task::JoinSet::new();
+        for (i, p) in user.positions.iter().enumerate() {
+            let mint = p.mint.clone();
+            set.spawn(async move {
+                let price = dexscreener::get_token_pair(&mint)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|pair| pair["priceUsd"].as_str().and_then(|s| s.parse::<f64>().ok()));
+                (i, price)
+            });
+        }
+        let mut prices: Vec<Option<f64>> = vec![None; user.positions.len()];
+        while let Some(res) = set.join_next().await {
+            if let Ok((i, price)) = res {
+                prices[i] = price;
+            }
+        }
+        let sol_price_usd = sol_handle.await.unwrap_or(0.0);
+
+        let mut msg = "📊 <b>Open Positions</b>\n\n".to_string();
+        for (i, p) in user.positions.iter().enumerate() {
+            let current_price_usd = prices[i];
+
+            match current_price_usd {
+                Some(cur) if p.entry_price_usd > 0.0 => {
+                    let pct = (cur / p.entry_price_usd - 1.0) * 100.0;
+                    let entry_value_usd = p.tokens_received_est * p.entry_price_usd;
+                    let current_value_usd = p.tokens_received_est * cur;
+                    let pl_usd = current_value_usd - entry_value_usd;
+                    let pl_sol = if sol_price_usd > 0.0 { pl_usd / sol_price_usd } else { 0.0 };
+                    let arrow = if pct >= 0.0 { "🟢" } else { "🔴" };
+                    msg += &format!(
+                        "{arrow} <b>{}</b>\n   Entry: ${:.8} → Now: ${:.8} ({pct:+.1}%)\n   P/L: {pl_sol:+.4} SOL (${pl_usd:+.2})\n\n",
+                        p.symbol, p.entry_price_usd, cur
+                    );
+                }
+                _ => {
+                    msg += &format!(
+                        "⚪ <b>{}</b> — spent {:.4} SOL, ~{:.2} tokens (live price unavailable)\n\n",
+                        p.symbol, p.sol_spent, p.tokens_received_est
+                    );
+                }
+            }
+        }
+        self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
+        Ok(())
+    }
+
+    async fn handle_buy_ca(&self, chat_id: i64, input: &str) -> Result<()> {
+        let Some(ca) = self.resolve_token_query(chat_id, input).await? else { return Ok(()); };
+        let ca = ca.as_str();
         self.tg.send_html(chat_id, "🔍 Scanning token...", None).await?;
         let pair = match dexscreener::get_token_pair(ca).await {
             Ok(Some(p)) => p,
@@ -845,6 +1009,8 @@ impl App {
             }
         }
 
+        self.log_platform_fee(&quote, "buy");
+
         self.tg.send_html(chat_id, "⚡ Executing swap...", None).await?;
 
         match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
@@ -893,23 +1059,7 @@ impl App {
         Ok(())
     }
 
-    async fn handle_sell_ca(&self, chat_id: i64, telegram_id: i64, ca: &str) -> Result<()> {
-        let mut user = self.get_or_create_user(telegram_id)?;
-        if let Some(kp) = self.session_keypair(telegram_id) {
-            self.execute_sell(chat_id, &mut user, &kp, ca).await?;
-        } else {
-            if let Some(m) = lockout_message(&user) {
-                self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
-                return Ok(());
-            }
-            user.awaiting = Awaiting::VerifyingPinForSell { ca: ca.to_string() };
-            self.db.save_user(&user)?;
-            self.tg.send_html(chat_id, "🔑 Enter your PIN to unlock trading (stays unlocked for 15 minutes):", Some(kb::cancel_to("main"))).await?;
-        }
-        Ok(())
-    }
-
-    async fn execute_sell(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str) -> Result<()> {
+    async fn execute_sell(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str, pct: u8) -> Result<()> {
         let (raw_balance, decimals) = match self.rpc.get_token_balance(&user.pubkey, ca).await {
             Ok(v) => v,
             Err(e) => {
@@ -922,9 +1072,20 @@ impl App {
             return Ok(());
         }
 
-        self.tg.send_html(chat_id, "⚡ Getting quote and executing full sell...", None).await?;
+        let pct = pct.clamp(1, 100);
+        let sell_raw: u64 = if pct >= 100 {
+            raw_balance
+        } else {
+            (((raw_balance as u128) * pct as u128) / 100) as u64
+        };
+        if sell_raw == 0 {
+            self.tg.send_html(chat_id, "❌ That percentage rounds down to zero tokens — pick a higher percentage.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
 
-        let quote = match self.jup.get_quote(ca, SOL_MINT, raw_balance, user.slippage_bps).await {
+        self.tg.send_html(chat_id, &format!("⚡ Getting quote and executing {pct}% sell..."), None).await?;
+
+        let quote = match self.jup.get_quote(ca, SOL_MINT, sell_raw, user.slippage_bps).await {
             Ok(q) => q,
             Err(e) => {
                 self.tg.send_html(chat_id, &format!("❌ Couldn't get a swap quote: {e}"), Some(kb::main_only())).await?;
@@ -932,16 +1093,27 @@ impl App {
             }
         };
 
+        self.log_platform_fee(&quote, "sell");
+
         match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
             Ok(sig) => {
                 let est_out_sol = out_amount(&quote).unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
-                let human_amount = raw_balance as f64 / 10f64.powi(decimals as i32);
+                let human_amount = sell_raw as f64 / 10f64.powi(decimals as i32);
 
-                user.positions.retain(|p| p.mint != ca);
+                if pct >= 100 {
+                    user.positions.retain(|p| p.mint != ca);
+                } else if let Some(p) = user.positions.iter_mut().find(|p| p.mint == ca) {
+                    // Reduce the tracked cost-basis/holdings by the sold
+                    // fraction so PnL on the remainder stays meaningful,
+                    // rather than deleting or leaving the position stale.
+                    let frac_remaining = 1.0 - (pct as f64 / 100.0);
+                    p.sol_spent *= frac_remaining;
+                    p.tokens_received_est *= frac_remaining;
+                }
                 self.db.save_user(user)?;
 
                 self.tg.send_html(chat_id, &format!(
-                    "✅ <b>Sell sent</b>\n\n🪙 Sold: ~{human_amount:.4} tokens\n💰 Est. received: {est_out_sol:.4} SOL\n🔗 Tx: <code>{sig}</code>"
+                    "✅ <b>Sell sent</b>\n\n🪙 Sold: ~{human_amount:.4} tokens ({pct}%)\n💰 Est. received: {est_out_sol:.4} SOL\n🔗 Tx: <code>{sig}</code>"
                 ), Some(kb::main_only())).await?;
             }
             Err(e) => {
@@ -949,6 +1121,38 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Prints what Jupiter's quote actually says about the platform fee
+    /// for this trade, so a silently-missing fee shows up in the server
+    /// logs immediately instead of only being noticed (much later) as a
+    /// missing deposit in the fee wallet. If FEE_WALLET is configured but
+    /// `platformFee` is absent/zero on a quote, that's the single
+    /// clearest signal something is wrong with fee collection --
+    /// most commonly the fee wallet's wrapped-SOL token account not
+    /// existing (or having been closed) on-chain. See the note on
+    /// `jupiter::derive_wsol_fee_account` for why that account has to
+    /// exist ahead of time.
+    fn log_platform_fee(&self, quote: &serde_json::Value, side: &str) {
+        if self.fee_wallet.is_empty() {
+            return;
+        }
+        match quote.get("platformFee") {
+            Some(pf) if pf.is_object() => {
+                let amount = pf["amount"].as_str().unwrap_or("0");
+                let fee_bps = pf["feeBps"].as_u64().unwrap_or(0);
+                println!("💵 [{side}] platform fee in quote: amount={amount} feeBps={fee_bps}");
+            }
+            _ => {
+                eprintln!(
+                    "⚠️ [{side}] quote had NO platformFee field even though FEE_WALLET is set. \
+                     This trade will NOT pay a platform fee. Most likely cause: the fee \
+                     wallet's wrapped-SOL token account doesn't exist on-chain (or was closed \
+                     after being unwrapped). Verify/recreate it -- see derive_wsol_fee_account \
+                     in jupiter.rs."
+                );
+            }
+        }
     }
 
     async fn sign_and_send_swap(&self, keypair: &Keypair, pubkey: &str, quote: &serde_json::Value) -> Result<String> {
@@ -1055,150 +1259,117 @@ impl App {
     /// Handles one event from the PumpPortal WebSocket feed -- the earliest
     /// possible signal, since tokens land here at creation, before
     /// DexScreener has any listing for them.
+    /// No more per-event alerts here -- pump.fun throws off way too much
+    /// volume for a message-per-token to be usable. We just keep the
+    /// PumpWatch record up to date (curve progress, cached authority
+    /// check, migration status); the AI Gem Scanner (`handle_gem_scan`)
+    /// is what actually scores and surfaces the worthwhile ones, on
+    /// demand, filtered down to Moderate/High potential only.
     pub async fn handle_pump_event(&self, event: PumpEvent) {
         match event {
             PumpEvent::NewToken(data) => {
-                // Way too high volume to alert on (hundreds/min) -- just
-                // track first_seen so later stages know how early we caught it.
                 if self.db.get_pump_watch(&data.mint).ok().flatten().is_none() {
                     let _ = self.db.save_pump_watch(&data.mint, &crate::db::PumpWatch {
+                        mint: data.mint.clone(),
                         name: data.name,
                         symbol: data.symbol,
                         first_seen: crate::state::chrono_now(),
-                        alerted_curve: false,
-                        alerted_migration: false,
+                        ..Default::default()
                     });
                 }
             }
 
             PumpEvent::CurveProgress(data) => {
-                let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or(crate::db::PumpWatch {
-                    name: data.name.clone(),
-                    symbol: data.symbol.clone(),
-                    first_seen: crate::state::chrono_now(),
-                    alerted_curve: false,
-                    alerted_migration: false,
-                });
-                if watch.alerted_curve {
-                    return;
-                }
-                watch.alerted_curve = true;
-                let _ = self.db.save_pump_watch(&data.mint, &watch);
-
                 // Spawn so an on-chain lookup for one token never delays
                 // processing of the next PumpPortal event in the stream.
                 let app = self.clone();
                 tokio::spawn(async move {
-                    app.alert_if_worthy_curve(data, watch).await;
+                    app.update_pump_watch_curve(data).await;
                 });
             }
 
             PumpEvent::Migrated(data) => {
-                let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or(crate::db::PumpWatch {
+                let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or_else(|| crate::db::PumpWatch {
+                    mint: data.mint.clone(),
                     name: data.name.clone(),
                     symbol: data.symbol.clone(),
                     first_seen: crate::state::chrono_now(),
-                    alerted_curve: false,
-                    alerted_migration: false,
+                    ..Default::default()
                 });
-                if watch.alerted_migration {
-                    return;
-                }
-                watch.alerted_migration = true;
+                watch.migrated = true;
+                watch.migrated_at = crate::state::chrono_now();
                 let _ = self.db.save_pump_watch(&data.mint, &watch);
-
-                // Same reasoning -- DexScreener lookups + retries can take
-                // a few seconds, so don't block the event loop on them.
-                let app = self.clone();
-                tokio::spawn(async move {
-                    app.alert_if_worthy_migration(data, watch).await;
-                });
             }
         }
     }
 
-    /// Minimum Gem Scanner score (same 0-100 scale as the AI Gem Scanner
-    /// button) a just-migrated token must clear before we alert on it.
-    /// 60 lines up with the "MODERATE" tier and above -- raise this if
-    /// you still see too many weak alerts, lower it if you want more
-    /// volume at the cost of quality.
-    const MIGRATION_ALERT_MIN_SCORE: i32 = 60;
-
-    /// Pre-migration tokens have no DexScreener listing yet, so the only
-    /// signal available is on-chain: skip anything whose creator can
-    /// still mint unlimited new supply or freeze holder wallets. That's
-    /// the single biggest rug vector and cheap to check before ever
-    /// pinging anyone about a token that isn't even tradeable yet.
-    async fn alert_if_worthy_curve(&self, data: crate::pumpportal::TokenData, watch: crate::db::PumpWatch) {
-        match self.rpc.get_mint_authority_status(&data.mint).await {
-            Ok((mint_ok, freeze_ok)) if mint_ok && freeze_ok => {}
-            _ => return, // still has an active mint/freeze authority, or RPC couldn't tell -- skip
+    /// Refreshes a pre-migration token's bonding-curve progress and cached
+    /// "authorities renounced" check. Runs off the hot event-loop path
+    /// (see `handle_pump_event`) since the RPC call can take a moment.
+    async fn update_pump_watch_curve(&self, data: crate::pumpportal::TokenData) {
+        let mut watch = self.db.get_pump_watch(&data.mint).ok().flatten().unwrap_or_else(|| crate::db::PumpWatch {
+            mint: data.mint.clone(),
+            name: data.name.clone(),
+            symbol: data.symbol.clone(),
+            first_seen: crate::state::chrono_now(),
+            ..Default::default()
+        });
+        watch.last_curve_pct = (data.v_sol_in_bonding_curve / MIGRATION_SOL_APPROX_FOR_DISPLAY * 100.0).min(100.0);
+        if let Ok((mint_ok, freeze_ok)) = self.rpc.get_mint_authority_status(&data.mint).await {
+            watch.authorities_ok = Some(mint_ok && freeze_ok);
         }
-
-        let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
-        let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
-        let name_esc = crate::telegram::escape_html(&name);
-        let symbol_esc = crate::telegram::escape_html(&symbol);
-        let pct = (data.v_sol_in_bonding_curve / MIGRATION_SOL_APPROX_FOR_DISPLAY * 100.0).min(100.0);
-        let msg = format!(
-            "👀 <b>Early Watch — Pump.fun</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n📈 Bonding curve: ~{pct:.0}% toward migration\n✅ Mint & freeze authority renounced\n\n⚠️ Still pre-migration — <b>not buyable through this bot yet</b>. A migration alert will follow if it graduates and clears our quality bar.",
-            data.mint,
-        );
-        self.broadcast_to_gem_alert_subscribers(&msg, None).await;
+        let _ = self.db.save_pump_watch(&data.mint, &watch);
     }
 
-    /// Only alerts on a migration if it actually clears a real quality
-    /// bar -- the same DexScreener + on-chain scoring the AI Gem Scanner
-    /// uses, not just "a pool exists now". Most migrations are noise;
-    /// this cuts it down to the ones worth a trader's attention.
-    async fn alert_if_worthy_migration(&self, data: crate::pumpportal::TokenData, watch: crate::db::PumpWatch) {
-        // DexScreener can take a few seconds to index a brand-new pool
-        // right after migration -- retry briefly instead of giving up
-        // (and staying silent) on the very first miss.
-        let mut pair = None;
-        for _ in 0..5 {
-            pair = dexscreener::get_token_pair(&data.mint).await.ok().flatten();
-            if pair.is_some() {
-                break;
+    /// Scores a still-pre-migration pump.fun token using only what we know
+    /// before it has any DexScreener listing: renounced authorities,
+    /// bonding-curve progress, and freshness. Same 0-100 scale / tier
+    /// labels as the DexScreener-based scorer so both sources show up
+    /// side-by-side in the AI Gem Scanner as one consistent list.
+    fn score_pump_watch(watch: &crate::db::PumpWatch) -> (i32, Vec<String>) {
+        let mut score = 0i32;
+        let mut notes = vec![];
+
+        match watch.authorities_ok {
+            Some(true) => {
+                score += 40;
+                notes.push("✅ Mint & freeze authority renounced".to_string());
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-        let Some(pair) = pair else {
-            // Can't verify quality yet -- stay quiet rather than alert blind.
-            return;
-        };
-
-        let mut signal = dexscreener::score_gem(&pair, None);
-        self.apply_onchain_checks(&data.mint, &mut signal).await;
-
-        if signal.score < Self::MIGRATION_ALERT_MIN_SCORE {
-            return;
+            Some(false) => {
+                return (0, vec!["🚨 Mint/freeze authority still active — skipped".to_string()]);
+            }
+            None => {
+                // Haven't gotten a curve-progress event (and therefore an
+                // authority check) for this one yet -- treat as unknown,
+                // neither rewarded nor zeroed out.
+            }
         }
 
-        let name = if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() };
-        let symbol = if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() };
-        let name_esc = crate::telegram::escape_html(&name);
-        let symbol_esc = crate::telegram::escape_html(&symbol);
-        let top_notes = if signal.notes.is_empty() {
-            String::new()
+        if watch.last_curve_pct >= 50.0 && watch.last_curve_pct < 95.0 {
+            score += 30;
+            notes.push(format!("📈 ~{:.0}% toward migration — real buying pressure", watch.last_curve_pct));
+        } else if watch.last_curve_pct >= 20.0 {
+            score += 15;
+            notes.push(format!("📈 ~{:.0}% toward migration", watch.last_curve_pct));
+        } else if watch.last_curve_pct > 0.0 {
+            score += 5;
+        }
+
+        let age_hours = (crate::state::chrono_now() - watch.first_seen) as f64 / 3600.0;
+        if age_hours < 1.0 {
+            score += 10;
+            notes.push("🆕 Brand new (under 1h)".to_string());
+        } else if age_hours < 6.0 {
+            score += 15;
+            notes.push("🆕 Very early (under 6h)".to_string());
         } else {
-            format!(
-                "\n{}",
-                signal.notes.iter().take(3).map(|n| crate::telegram::escape_html(n)).collect::<Vec<_>>().join(" | ")
-            )
-        };
-        let msg = format!(
-            "🚀 <b>Just Migrated — Worth A Look</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n🤖 Score: {}/100 — {}{top_notes}\n\nGraduated from the pump.fun bonding curve to a real trading pool. Now tradeable.\n\n<i>Tap buy to trade instantly 👇 Always DYOR — a good score doesn't guarantee it holds.</i>",
-            data.mint, signal.score, signal.tier,
-        );
-        let kb = vec![
-            vec![crate::telegram::btn(&format!("🚀 Buy ${symbol}"), &format!("bcp_{}", data.mint))],
-            vec![crate::telegram::btn("❌ Skip", "main")],
-        ];
-        self.broadcast_to_gem_alert_subscribers(&msg, Some(kb)).await;
+            score += 5;
+        }
+
+        (score.clamp(0, 100), notes)
     }
 
-(&self, msg: &str, kb: Option<Vec<Vec<crate::telegram::InlineButton>>>) {
+    async fn broadcast_to_gem_alert_subscribers(&self, msg: &str, kb: Option<Vec<Vec<crate::telegram::InlineButton>>>) {
         for item in self.db.inner_iter() {
             if let Ok((_, bytes)) = item {
                 if let Ok(user) = serde_json::from_slice::<crate::state::UserRecord>(&bytes) {
@@ -1258,7 +1429,7 @@ impl App {
                 let liq_disp = fmt_usd(liq);
                 let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
                 let fresh_tag = if signal.is_fresh { "🆕 " } else { "" };
-                let notes = signal.notes.iter().take(4).map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n");
+                let notes = signal.notes.iter().take(4).map(|n| format!("• {}", crate::telegram::escape_html(n))).collect::<Vec<_>>().join("\n");
 
                 let msg = format!(
                     "💎 <b>{fresh_tag}Gem Alert!</b>\n\n🪙 <b>{name_esc} (${symbol_esc})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq_disp} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}\n{notes}\n\n<i>Tap buy to trade instantly 👇</i>",
@@ -1340,63 +1511,150 @@ impl App {
         Ok(())
     }
 
+    /// Only Moderate potential (⚡ 55+) and above get shown here -- this is
+    /// the "worthy ones only" bar for the whole scanner, covering both the
+    /// regular DexScreener sweep and the pump.fun (pre/post-migration)
+    /// candidates below.
+    const GEM_SCAN_MIN_SCORE: i32 = 55;
+
     async fn handle_gem_scan(&self, chat_id: i64) -> Result<()> {
-        self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nScanning Solana for high-potential tokens...", None).await?;
+        self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nScanning Solana (incl. pump.fun pre/post-migration) for high-potential tokens...", None).await?;
 
+        let mut entries: Vec<GemEntry> = vec![];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 1) Regular DexScreener sweep (established + newly-listed tokens).
         let pairs = dexscreener::get_trending_solana_pairs().await.unwrap_or_default();
-        if pairs.is_empty() {
-            self.tg.send_html(chat_id, "❌ Couldn't fetch market data. Try again.", Some(kb::main_only())).await?;
-            return Ok(());
-        }
-
-        let mut gems: Vec<(&serde_json::Value, dexscreener::GemSignal)> = vec![];
         for pair in &pairs {
-            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
-            let prev = self.db.get_gem_snapshot(ca).ok().flatten();
+            let ca = pair["baseToken"]["address"].as_str().unwrap_or("").to_string();
+            if ca.is_empty() || seen.contains(&ca) {
+                continue;
+            }
+            let prev = self.db.get_gem_snapshot(&ca).ok().flatten();
             let prev_snap = prev.as_ref().map(|p| dexscreener::Snapshot { liq_usd: p.liq_usd, vol_h24: p.vol_h24 });
             let mut signal = dexscreener::score_gem(pair, prev_snap.as_ref());
-            self.apply_onchain_checks(ca, &mut signal).await;
-            if signal.score >= 40 {
-                gems.push((pair, signal));
+            self.apply_onchain_checks(&ca, &mut signal).await;
+            if signal.score < Self::GEM_SCAN_MIN_SCORE {
+                continue;
+            }
+            seen.insert(ca.clone());
+            entries.push(GemEntry {
+                ca,
+                name: pair["baseToken"]["name"].as_str().unwrap_or("Unknown").to_string(),
+                symbol: pair["baseToken"]["symbol"].as_str().unwrap_or("???").to_string(),
+                score: signal.score,
+                tier: signal.tier,
+                notes: signal.notes,
+                mc: pair["fdv"].as_f64(),
+                liq: pair["liquidity"]["usd"].as_f64(),
+                change1h: pair["priceChange"]["h1"].as_f64(),
+                is_fresh: signal.is_fresh,
+                pre_migration: false,
+            });
+        }
+
+        // 2) Pump.fun candidates we've been quietly tracking -- both
+        // still-on-the-curve tokens and ones that just migrated but may
+        // not have hit the DexScreener trending feed yet.
+        for item in self.db.inner_iter() {
+            let Ok((key, bytes)) = item else { continue };
+            if !key.starts_with(b"pump:") {
+                continue;
+            }
+            let Ok(watch) = serde_json::from_slice::<crate::db::PumpWatch>(&bytes) else { continue };
+            if watch.mint.is_empty() || seen.contains(&watch.mint) {
+                continue;
+            }
+            let age_hours = (crate::state::chrono_now() - watch.first_seen) as f64 / 3600.0;
+            if age_hours > 12.0 {
+                continue; // stale -- bonding-curve tokens rarely stay relevant this long
+            }
+
+            if watch.migrated {
+                let Ok(Some(pair)) = dexscreener::get_token_pair(&watch.mint).await else { continue };
+                let mut signal = dexscreener::score_gem(&pair, None);
+                self.apply_onchain_checks(&watch.mint, &mut signal).await;
+                if signal.score < Self::GEM_SCAN_MIN_SCORE {
+                    continue;
+                }
+                seen.insert(watch.mint.clone());
+                entries.push(GemEntry {
+                    ca: watch.mint.clone(),
+                    name: pair["baseToken"]["name"].as_str().unwrap_or("Unknown").to_string(),
+                    symbol: pair["baseToken"]["symbol"].as_str().unwrap_or("???").to_string(),
+                    score: signal.score,
+                    tier: signal.tier,
+                    notes: signal.notes,
+                    mc: pair["fdv"].as_f64(),
+                    liq: pair["liquidity"]["usd"].as_f64(),
+                    change1h: pair["priceChange"]["h1"].as_f64(),
+                    is_fresh: signal.is_fresh,
+                    pre_migration: false,
+                });
+            } else {
+                let (score, notes) = Self::score_pump_watch(&watch);
+                if score < Self::GEM_SCAN_MIN_SCORE {
+                    continue;
+                }
+                seen.insert(watch.mint.clone());
+                entries.push(GemEntry {
+                    ca: watch.mint.clone(),
+                    name: if watch.name.is_empty() { "Unknown".to_string() } else { watch.name.clone() },
+                    symbol: if watch.symbol.is_empty() { "???".to_string() } else { watch.symbol.clone() },
+                    score,
+                    tier: dexscreener::tier_for_score(score),
+                    notes,
+                    mc: None,
+                    liq: None,
+                    change1h: None,
+                    is_fresh: age_hours < 6.0,
+                    pre_migration: true,
+                });
             }
         }
 
-        if gems.is_empty() {
-            self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nNo standout gems found in current market data. Try again in a few minutes for fresh signals.", Some(kb::main_only())).await?;
+        if entries.is_empty() {
+            self.tg.send_html(chat_id, "💎 <b>AI Gem Scanner</b>\n\nNo standout gems found right now (nothing cleared the Moderate+ bar). Try again in a few minutes for fresh signals.", Some(kb::main_only())).await?;
             return Ok(());
         }
 
-        gems.sort_by(|a, b| b.1.score.cmp(&a.1.score));
+        entries.sort_by(|a, b| b.score.cmp(&a.score));
+        entries.truncate(5);
 
         let mut msg = "💎 <b>AI Gem Scanner — Top Picks</b>\n\n".to_string();
-        for (pair, signal) in gems.iter().take(5) {
-            let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
-            let name = pair["baseToken"]["name"].as_str().unwrap_or("Unknown");
-            let name_esc = crate::telegram::escape_html(name);
-            let symbol_esc = crate::telegram::escape_html(symbol);
-            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
-            let mc = pair["fdv"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
-            let liq = pair["liquidity"]["usd"].as_f64().map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
-            let change1h = pair["priceChange"]["h1"].as_f64().unwrap_or(0.0);
-            let fresh_tag = if signal.is_fresh { "🆕 " } else { "" };
-            let top_note = if signal.notes.is_empty() { String::new() } else {
-                format!("\n{}", signal.notes.iter().take(2).cloned().collect::<Vec<_>>().join(" | "))
+        for e in &entries {
+            let name_esc = crate::telegram::escape_html(&e.name);
+            let symbol_esc = crate::telegram::escape_html(&e.symbol);
+            let fresh_tag = if e.is_fresh { "🆕 " } else { "" };
+            let top_note = if e.notes.is_empty() { String::new() } else {
+                format!("\n{}", e.notes.iter().take(2).map(|n| crate::telegram::escape_html(n)).collect::<Vec<_>>().join(" | "))
             };
 
-            msg += &format!(
-                "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name_esc} (${symbol_esc})</b>\n📋 <code>{ca}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}{top_note}\n\n",
-                signal.score, signal.tier
-            );
+            if e.pre_migration {
+                msg += &format!(
+                    "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n⏳ Pre-migration (bonding curve) — not tradeable through this bot yet\n🤖 Score: {}/100 — {}{top_note}\n\n",
+                    e.ca, e.score, e.tier
+                );
+            } else {
+                let mc = e.mc.map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
+                let liq = e.liq.map(fmt_usd).unwrap_or_else(|| "N/A".to_string());
+                let change1h = e.change1h.unwrap_or(0.0);
+                msg += &format!(
+                    "━━━━━━━━━━━━\n🪙 <b>{fresh_tag}{name_esc} (${symbol_esc})</b>\n📋 <code>{}</code>\n💎 MC: {mc} | 💧 Liq: {liq} | 📈 {change1h:+.1}% (1h)\n🤖 Score: {}/100 — {}{top_note}\n\n",
+                    e.ca, e.score, e.tier
+                );
+            }
         }
         msg += "⚠️ <i>Not financial advice. Always DYOR before buying.</i>";
 
         let mut kb: Vec<Vec<crate::telegram::InlineButton>> = vec![];
-        for (pair, signal) in gems.iter().take(5) {
-            let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("???");
-            let ca = pair["baseToken"]["address"].as_str().unwrap_or("");
-            let stars = if signal.score >= 75 { "🚀" } else if signal.score >= 55 { "⚡" } else { "👀" };
+        for e in &entries {
+            if e.pre_migration {
+                continue; // not tradeable through Jupiter until it migrates
+            }
+            let stars = if e.score >= 75 { "🚀" } else { "⚡" };
             kb.push(vec![
-                crate::telegram::btn(&format!("{stars} Buy ${symbol}"), &format!("bcp_{ca}")),
+                crate::telegram::btn(&format!("{stars} Buy ${}", e.symbol), &format!("bcp_{}", e.ca)),
             ]);
         }
         kb.push(vec![crate::telegram::btn("🏠 Main Menu", "main")]);

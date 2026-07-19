@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::error::Error as _;
 
 #[derive(Clone)]
 pub struct TgClient {
@@ -84,10 +85,35 @@ impl TgClient {
         SafeTgError(s.as_ref().replace(&self.token, "[REDACTED_BOT_TOKEN]"))
     }
 
+    /// Like `redact`, but walks the full `.source()` chain of the error
+    /// first. reqwest's top-level message alone ("error sending request
+    /// for url (...)") tells you almost nothing -- the actual reason
+    /// (DNS failure, TLS/certificate error, connection refused, timed
+    /// out, etc.) lives further down the chain and was previously being
+    /// thrown away by calling `.to_string()` on just the outer error.
+    fn redact_chain(&self, e: &reqwest::Error) -> SafeTgError {
+        let mut msg = e.to_string();
+        let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
+        while let Some(s) = cur {
+            msg.push_str(" — caused by: ");
+            msg.push_str(&s.to_string());
+            cur = s.source();
+        }
+        self.redact(msg)
+    }
+
     pub fn new(token: String) -> Self {
         Self {
             token,
-            http: reqwest::Client::new(),
+            // Forced to HTTP/1.1: some hosts/CDNs (and the network paths in
+            // front of them) negotiate HTTP/2 via ALPN in a way this
+            // client's stack doesn't cleanly handle, which surfaces as
+            // "invalid HTTP version parsed" on every request. HTTP/1.1
+            // sidesteps that -- there's no h2-specific benefit we need here.
+            http: reqwest::Client::builder()
+                .http1_only()
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 
@@ -102,10 +128,10 @@ impl TgClient {
             .query(&[("offset", offset.to_string()), ("timeout", "30".to_string())])
             .send()
             .await
-            .map_err(|e| self.redact(e.to_string()))?
+            .map_err(|e| self.redact_chain(&e))?
             .json()
             .await
-            .map_err(|e| self.redact(e.to_string()))?;
+            .map_err(|e| self.redact_chain(&e))?;
         Ok(resp.result.unwrap_or_default())
     }
 
@@ -124,10 +150,10 @@ impl TgClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| self.redact(e.to_string()))?
+            .map_err(|e| self.redact_chain(&e))?
             .json()
             .await
-            .map_err(|e| self.redact(e.to_string()))?;
+            .map_err(|e| self.redact_chain(&e))?;
         if !resp.ok {
             log_err(&resp);
             return Ok(None);
@@ -146,10 +172,10 @@ impl TgClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| self.redact(e.to_string()))?
+            .map_err(|e| self.redact_chain(&e))?
             .json()
             .await
-            .map_err(|e| self.redact(e.to_string()))?;
+            .map_err(|e| self.redact_chain(&e))?;
         Ok(())
     }
 
@@ -160,10 +186,10 @@ impl TgClient {
             .json(&json!({ "chat_id": chat_id, "message_id": message_id }))
             .send()
             .await
-            .map_err(|e| self.redact(e.to_string()))?
+            .map_err(|e| self.redact_chain(&e))?
             .json()
             .await
-            .map_err(|e| self.redact(e.to_string()))?;
+            .map_err(|e| self.redact_chain(&e))?;
         Ok(())
     }
 }

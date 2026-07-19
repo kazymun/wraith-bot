@@ -1,3 +1,4 @@
+use crate::state::Position;
 use crate::telegram::{btn, Keyboard};
 
 pub fn main_menu() -> Keyboard {
@@ -63,6 +64,39 @@ pub fn slippage_menu() -> Keyboard {
     vec![
         vec![btn("1%", "slip_100"), btn("3%", "slip_300"), btn("5%", "slip_500"), btn("10%", "slip_1000")],
         vec![btn("🏠 Main Menu", "main")],
+    ]
+}
+
+/// One button per open position, so selling is "tap the coin" instead of
+/// pasting its CA. Callback data is `sellsel_<mint>` (mint addresses are
+/// well under Telegram's 64-byte callback_data limit on their own).
+pub fn position_list(positions: &[Position]) -> Keyboard {
+    let mut kb: Keyboard = positions
+        .iter()
+        .map(|p| {
+            vec![btn(
+                &format!("🪙 {} — {:.4} SOL in", p.symbol, p.sol_spent),
+                &format!("sellsel_{}", p.mint),
+            )]
+        })
+        .collect();
+    kb.push(vec![btn("❌ Cancel", "main")]);
+    kb
+}
+
+/// How much of a held token to sell, as a percentage of current balance.
+pub fn sell_percent_menu(ca: &str) -> Keyboard {
+    vec![
+        vec![
+            btn("25%", &format!("sellpct_{ca}_25")),
+            btn("50%", &format!("sellpct_{ca}_50")),
+            btn("75%", &format!("sellpct_{ca}_75")),
+        ],
+        vec![
+            btn("💯 100% (All)", &format!("sellpct_{ca}_100")),
+            btn("✏️ Custom %", &format!("sellpct_{ca}_custom")),
+        ],
+        vec![btn("❌ Cancel", "main")],
     ]
 }
 

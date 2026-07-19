@@ -11,7 +11,13 @@ impl SolanaRpc {
     pub fn new(url: String) -> Self {
         Self {
             url,
-            http: reqwest::Client::new(),
+            // Forced to HTTP/1.1 -- see telegram.rs for why (ALPN/h2
+            // negotiation on some RPC providers was surfacing as
+            // "invalid HTTP version parsed").
+            http: reqwest::Client::builder()
+                .http1_only()
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 
@@ -67,6 +73,17 @@ impl SolanaRpc {
             .ok_or_else(|| anyhow!("could not parse token amount"))?;
         let decimals = info["decimals"].as_u64().unwrap_or(9) as u8;
         Ok((raw, decimals))
+    }
+
+    /// Whether an account exists on-chain at all (regardless of type).
+    /// Used to check, at startup, whether the platform fee wallet's
+    /// wrapped-SOL token account has actually been created -- if it
+    /// hasn't, Jupiter has nowhere to deliver the platform fee and every
+    /// trade will silently pay $0 in fees despite `platformFeeBps` being
+    /// set on every quote.
+    pub async fn get_account_exists(&self, pubkey: &str) -> Result<bool> {
+        let result = self.call("getAccountInfo", json!([pubkey, { "encoding": "base64" }])).await?;
+        Ok(!result["value"].is_null())
     }
 
     pub async fn get_mint_decimals(&self, mint: &str) -> Result<u8> {

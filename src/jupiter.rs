@@ -64,7 +64,12 @@ pub struct Jupiter {
 impl Jupiter {
     pub fn new(api_key: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // Forced to HTTP/1.1 -- see telegram.rs for why (ALPN/h2
+            // negotiation was surfacing as "invalid HTTP version parsed").
+            http: reqwest::Client::builder()
+                .http1_only()
+                .build()
+                .expect("failed to build reqwest client"),
             api_key,
         }
     }
