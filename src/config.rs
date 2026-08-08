@@ -19,6 +19,11 @@ pub struct Config {
     /// attacker hardware. 6+ raises that to 1,000,000+ combinations.
     /// Enforce this in handlers.rs wherever a PIN is set or changed.
     pub min_pin_length: usize,
+    /// Telegram user IDs that bypass the subscription paywall entirely --
+    /// for friends/testers/yourself. Comma-separated in FREE_ACCESS_IDS,
+    /// e.g. "123456789,987654321". Get a user's ID by having them message
+    /// @userinfobot on Telegram.
+    pub free_access_ids: Vec<i64>,
 }
 
 impl Config {
@@ -49,6 +54,13 @@ impl Config {
             .parse()
             .unwrap_or(6);
         let jupiter_api_key = std::env::var("JUPITER_API_KEY").ok().filter(|s| !s.is_empty());
+        let free_access_ids: Vec<i64> = std::env::var("FREE_ACCESS_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
 
         // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
         // key anywhere that decrypts every user's wallet. Each user's
@@ -64,6 +76,7 @@ impl Config {
             fee_wallet,
             min_pin_length,
             jupiter_api_key,
+            free_access_ids,
         })
     }
 }

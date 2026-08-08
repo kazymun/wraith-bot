@@ -68,6 +68,8 @@ pub struct App {
     pub default_slippage_bps: u32,
     pub fee_wallet: String,
     pub min_pin_length: usize,
+    /// Telegram IDs that always have access, no subscription required.
+    pub free_access_ids: Vec<i64>,
     sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
@@ -81,6 +83,7 @@ impl App {
         default_slippage_bps: u32,
         fee_wallet: String,
         min_pin_length: usize,
+        free_access_ids: Vec<i64>,
     ) -> Self {
         Self {
             tg,
@@ -91,11 +94,19 @@ impl App {
             default_slippage_bps,
             fee_wallet,
             min_pin_length,
+            free_access_ids,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     // ---------- trading session cache ----------
+
+    /// Whether this user currently has access -- either an active paid
+    /// subscription, or their Telegram ID is on the free-access allowlist
+    /// (friends/testers, set via FREE_ACCESS_IDS).
+    fn has_access(&self, user: &UserRecord) -> bool {
+        self.free_access_ids.contains(&user.telegram_id) || user.subscription_expires_at > crate::state::chrono_now()
+    }
 
     fn session_keypair(&self, telegram_id: i64) -> Option<Keypair> {
         let now = crate::state::chrono_now();
@@ -202,7 +213,7 @@ impl App {
 
     pub async fn show_main(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let user = self.get_or_create_user(telegram_id)?;
-        if !is_subscribed(&user) {
+        if !self.has_access(&user) {
             self.send_subscribe_prompt(chat_id, &user).await?;
             return Ok(());
         }
@@ -616,7 +627,7 @@ impl App {
         if !matches!(cmd, "/start" | "/cancel" | "/help") {
             let user = self.get_or_create_user(telegram_id)?;
             let mid_pin_setup = matches!(user.awaiting, Awaiting::SettingPin { .. });
-            if !mid_pin_setup && !is_subscribed(&user) {
+            if !mid_pin_setup && !self.has_access(&user) {
                 self.send_subscribe_prompt(chat_id, &user).await?;
                 return Ok(());
             }
@@ -690,7 +701,7 @@ impl App {
             return Ok(());
         }
 
-        if !is_subscribed(&user) && !matches!(data, "wallet" | "main" | "refresh" | "subscribe" | "del_msg") {
+        if !self.has_access(&user) && !matches!(data, "wallet" | "main" | "refresh" | "subscribe" | "del_msg") {
             self.send_subscribe_prompt(chat_id, &user).await?;
             return Ok(());
         }
@@ -705,7 +716,7 @@ impl App {
                 self.show_main(chat_id, telegram_id).await?;
             }
             "subscribe" => {
-                if is_subscribed(&user) {
+                if self.has_access(&user) {
                     self.tg.send_html(chat_id, "✅ You're already subscribed.", Some(kb::main_only())).await?;
                 } else {
                     user.awaiting = Awaiting::VerifyingPinForSubscribe;
@@ -1793,12 +1804,6 @@ impl App {
         self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
         Ok(())
     }
-}
-
-/// Whether the user currently has active paid access. 0 (never
-/// subscribed) is always treated as expired.
-fn is_subscribed(user: &UserRecord) -> bool {
-    user.subscription_expires_at > crate::state::chrono_now()
 }
 
 fn lockout_message(user: &UserRecord) -> Option<String> {
