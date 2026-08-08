@@ -37,6 +37,9 @@ pub enum Awaiting {
     EnteringRugScanCA,
     EnteringImportKey,
     EnteringCustomBuyAmount { ca: String },
+    /// Waiting for the user's PIN to authorize a subscription payment
+    /// (plain SOL transfer to FEE_WALLET, see wallet::build_sol_transfer_b64).
+    VerifyingPinForSubscribe,
 }
 
 impl Default for Awaiting {
@@ -129,6 +132,12 @@ pub struct UserRecord {
     /// account-takeover drains and clipboard-hijack attacks.
     #[serde(default)]
     pub known_withdraw_addresses: Vec<String>,
+    /// Unix timestamp (seconds) until which this user's subscription is
+    /// active. 0 (the default for existing users) means "never
+    /// subscribed" -- always treated as expired. Checked in handlers.rs
+    /// before allowing any bot functionality.
+    #[serde(default)]
+    pub subscription_expires_at: i64,
 }
 
 impl UserRecord {
@@ -146,6 +155,7 @@ impl UserRecord {
             created_at: chrono_now(),
             gem_alerts: true,
             known_withdraw_addresses: vec![],
+            subscription_expires_at: 0,
         }
     }
 }

@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose, Engine as _};
 use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::{hash::Hash, pubkey::Pubkey, system_instruction, transaction::Transaction};
+use std::str::FromStr;
 use zeroize::Zeroize;
 
 use crate::crypto::Crypto;
@@ -95,4 +98,31 @@ pub fn load_keypair(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<Key
 pub fn export_private_key_b58(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<String> {
     let plaintext = crypto.decrypt_with_pin(pin, &user.secret)?;
     String::from_utf8(plaintext).map_err(|e| anyhow!("corrupted key data: {e}"))
+}
+
+/// Builds and signs a plain SOL transfer (e.g. for subscription payments)
+/// from the user's own wallet to `dest_pubkey`, returning the
+/// base64-encoded signed transaction ready to submit via
+/// `SolanaRpc::send_raw_transaction_b64`. This does NOT touch Jupiter --
+/// it's a native system-program transfer, so there's no swap/slippage/
+/// route involved, and no platform fee logic applies (this *is* the fee).
+pub fn build_sol_transfer_b64(
+    keypair: &Keypair,
+    dest_pubkey: &str,
+    lamports: u64,
+    recent_blockhash: &str,
+) -> Result<String> {
+    let dest = Pubkey::from_str(dest_pubkey).map_err(|_| anyhow!("invalid destination pubkey"))?;
+    let blockhash = Hash::from_str(recent_blockhash).map_err(|_| anyhow!("invalid blockhash"))?;
+
+    let ix = system_instruction::transfer(&keypair.pubkey(), &dest, lamports);
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&keypair.pubkey()),
+        &[keypair],
+        blockhash,
+    );
+
+    let serialized = bincode::serialize(&tx).map_err(|e| anyhow!("failed to serialize transaction: {e}"))?;
+    Ok(general_purpose::STANDARD.encode(serialized))
 }

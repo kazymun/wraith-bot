@@ -11,6 +11,13 @@ pub fn main_menu() -> Keyboard {
     ]
 }
 
+pub fn subscribe_menu() -> Keyboard {
+    vec![
+        vec![btn("💳 Subscribe — 1 SOL/mo", "subscribe")],
+        vec![btn("💰 Wallet (deposit)", "wallet"), btn("🔄 Refresh", "main")],
+    ]
+}
+
 pub fn cancel_to(target: &str) -> Keyboard {
     vec![vec![btn("❌ Cancel", target)]]
 }

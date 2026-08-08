@@ -202,8 +202,81 @@ impl App {
 
     pub async fn show_main(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let user = self.get_or_create_user(telegram_id)?;
+        if !is_subscribed(&user) {
+            self.send_subscribe_prompt(chat_id, &user).await?;
+            return Ok(());
+        }
         let text = self.main_menu_text(chat_id, &user).await;
         self.tg.send_html(chat_id, &text, Some(kb::main_menu())).await?;
+        Ok(())
+    }
+
+    /// Shown in place of the main menu (or any gated action) whenever the
+    /// user's subscription has lapsed or never started. Deliberately still
+    /// shows their wallet address/balance so they can deposit funds to pay.
+    async fn send_subscribe_prompt(&self, chat_id: i64, user: &UserRecord) -> Result<()> {
+        let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        self.tg.send_html(
+            chat_id,
+            &format!(
+                "🔒 <b>Wraith is subscription-only</b>\n\n💳 <b>1 SOL / month</b> unlocks full access — buying, selling, AI tools, alerts, everything.\n\n👛 <b>Your wallet:</b>\n<code>{}</code>\n💰 <b>Balance:</b> {balance_sol:.4} SOL\n\nDeposit at least 1 SOL (plus a little extra for network fees), then tap Subscribe below.",
+                user.pubkey
+            ),
+            Some(kb::subscribe_menu()),
+        ).await?;
+        Ok(())
+    }
+
+    /// Sends exactly 1 SOL from the user's own wallet to `fee_wallet` and,
+    /// on success, extends `subscription_expires_at` by 30 days (stacking
+    /// on top of remaining time if they still had some left, rather than
+    /// resetting to exactly 30 days from now).
+    async fn do_subscribe_payment(&self, chat_id: i64, telegram_id: i64, keypair: &Keypair) -> Result<()> {
+        if self.fee_wallet.is_empty() {
+            self.tg.send_html(chat_id, "⚠️ Subscriptions aren't configured yet — contact the bot operator.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+        let dest_pubkey = match Pubkey::from_str(&self.fee_wallet) {
+            Ok(p) => p,
+            Err(_) => {
+                self.tg.send_html(chat_id, "⚠️ Subscription destination is misconfigured — contact the bot operator.", Some(kb::main_only())).await?;
+                return Ok(());
+            }
+        };
+
+        const SUBSCRIPTION_LAMPORTS: u64 = 1_000_000_000; // 1 SOL
+
+        let blockhash_str = self.rpc.get_latest_blockhash().await?;
+        let blockhash = solana_sdk::hash::Hash::from_str(&blockhash_str)?;
+
+        let instruction = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, SUBSCRIPTION_LAMPORTS);
+        let mut tx = Transaction::new_with_payer(&[instruction], Some(&keypair.pubkey()));
+        tx.sign(&[keypair], blockhash);
+
+        let tx_bytes = bincode::serialize(&tx)?;
+        let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tx_bytes);
+
+        match self.rpc.send_raw_transaction_b64(&tx_b64).await {
+            Ok(sig) => {
+                let mut user = self.get_or_create_user(telegram_id)?;
+                let now = crate::state::chrono_now();
+                let base = if user.subscription_expires_at > now { user.subscription_expires_at } else { now };
+                user.subscription_expires_at = base + 30 * 86_400;
+                self.db.save_user(&user)?;
+                self.tg.send_html(
+                    chat_id,
+                    &format!("✅ <b>Subscribed!</b>\n\n💸 1 SOL sent.\n🔗 Tx: <code>{sig}</code>\n\nAccess renewed for 30 days."),
+                    Some(kb::main_only()),
+                ).await?;
+            }
+            Err(e) => {
+                self.tg.send_html(
+                    chat_id,
+                    &format!("❌ Payment failed: {e}\n\nMake sure your wallet has at least 1 SOL plus a bit extra for network fees, then try again."),
+                    Some(kb::main_only()),
+                ).await?;
+            }
+        }
         Ok(())
     }
 
@@ -305,6 +378,23 @@ impl App {
                             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                         }
                         self.do_withdraw(chat_id, &kp, &dest, amount_sol).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
+                }
+            }
+
+            Awaiting::VerifyingPinForSubscribe => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.do_subscribe_payment(chat_id, telegram_id, &kp).await?;
                     }
                     None => {
                         self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
@@ -522,6 +612,16 @@ impl App {
 
     async fn handle_command(&self, chat_id: i64, telegram_id: i64, text: &str) -> Result<()> {
         let cmd = text.split_whitespace().next().unwrap_or("");
+
+        if !matches!(cmd, "/start" | "/cancel" | "/help") {
+            let user = self.get_or_create_user(telegram_id)?;
+            let mid_pin_setup = matches!(user.awaiting, Awaiting::SettingPin { .. });
+            if !mid_pin_setup && !is_subscribed(&user) {
+                self.send_subscribe_prompt(chat_id, &user).await?;
+                return Ok(());
+            }
+        }
+
         match cmd {
             "/start" => {
                 let user = self.get_or_create_user(telegram_id)?;
@@ -590,6 +690,11 @@ impl App {
             return Ok(());
         }
 
+        if !is_subscribed(&user) && !matches!(data, "wallet" | "main" | "refresh" | "subscribe" | "del_msg") {
+            self.send_subscribe_prompt(chat_id, &user).await?;
+            return Ok(());
+        }
+
         match data {
             "del_msg" => {
                 if let Some(mid) = message_id {
@@ -598,6 +703,15 @@ impl App {
             }
             "main" | "refresh" => {
                 self.show_main(chat_id, telegram_id).await?;
+            }
+            "subscribe" => {
+                if is_subscribed(&user) {
+                    self.tg.send_html(chat_id, "✅ You're already subscribed.", Some(kb::main_only())).await?;
+                } else {
+                    user.awaiting = Awaiting::VerifyingPinForSubscribe;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "🔑 Enter your PIN to confirm your 1 SOL/month payment:", None).await?;
+                }
             }
             "wallet" => {
                 let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
@@ -1679,6 +1793,12 @@ impl App {
         self.tg.send_html(chat_id, &msg, Some(kb::main_only())).await?;
         Ok(())
     }
+}
+
+/// Whether the user currently has active paid access. 0 (never
+/// subscribed) is always treated as expired.
+fn is_subscribed(user: &UserRecord) -> bool {
+    user.subscription_expires_at > crate::state::chrono_now()
 }
 
 fn lockout_message(user: &UserRecord) -> Option<String> {

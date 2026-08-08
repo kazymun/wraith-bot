@@ -142,6 +142,7 @@ impl Db {
             .get("known_withdraw_addresses")
             .and_then(|x| serde_json::from_value(x.clone()).ok())
             .unwrap_or_default();
+        let subscription_expires_at = v.get("subscription_expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
 
         Some(UserRecord {
             telegram_id,
@@ -156,6 +157,7 @@ impl Db {
             created_at,
             gem_alerts,
             known_withdraw_addresses,
+            subscription_expires_at,
         })
     }
 
