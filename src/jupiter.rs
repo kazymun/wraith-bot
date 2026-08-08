@@ -122,6 +122,13 @@ impl Jupiter {
     /// fee_wallet: if non-empty, Jupiter will route 0.5% to the wrapped-SOL
     /// token account derived from this address (NOT to the raw address
     /// itself -- see `derive_wsol_fee_account` for why).
+    ///
+    /// Jupiter's rule (ExactIn mode, which this bot uses): the feeAccount's
+    /// mint must be either the input OR output mint of the swap. Since SOL
+    /// is always one side of every swap this bot does (input on buys,
+    /// output on sells), the WSOL fee account is always valid -- no
+    /// direction check needed. (A prior "fix" here restricted this to
+    /// buys only, based on a misreading of Jupiter's docs -- reverted.)
     pub async fn get_swap_transaction(&self, quote: &Value, user_pubkey: &str, fee_wallet: &str) -> Result<String> {
         let url = format!("{}/swap", self.base_url());
         let mut body = serde_json::json!({
