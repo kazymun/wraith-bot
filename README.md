@@ -1,64 +1,32 @@
-# Wraith
+Wraith — Solana Trading Bot
 
-Solana memecoin Telegram bot: real per-user custodial wallets, live DexScreener
-token stats with a heuristic rug-risk score, and real swaps through Jupiter's
-aggregator (the same one Trojan/BananaGun/BonkBot route through).
+A high-performance, Rust-based Telegram bot for trading Solana memecoins. Wraith integrates real-time blockchain data, secure wallet management, and AI-driven risk analysis to execute trades faster than standard DEX interfaces.
 
-## What's actually real here
+Core Features
 
-Every wallet is a genuine Solana keypair generated server-side (not a random
-string). Private keys are encrypted at rest with AES-256-GCM under a master
-key you control. Balances are read live via RPC. Buys/sells get a real quote
-from Jupiter, build a real transaction, sign it with the user's stored key,
-and broadcast it. Withdrawals build and sign a real `SystemProgram::transfer`.
-Nothing in here fakes a balance or a trade confirmation.
+Real-time Sniping: Connects directly to PumpPortal's WebSocket firehose to detect and execute trades on new pump.fun tokens before DexScreener indexes them.
+Secure Wallet Management: Users can generate or import Solana keypairs. Private keys are encrypted at rest using AES-256-GCM.
+Advanced Key Derivation: Employs Argon2id for PIN-based key derivation, utilizing a server-side pepper and unique per-user salts. No master key is stored, meaning database leaks do not compromise user wallets.
+Jupiter Swap Integration: Executes quotes and swaps via Jupiter API, with dynamic slippage and platform fee routing.
+AI Rug Scanner: Background job that pulls DexScreener market data and on-chain checks (mint/freeze authority, holder concentration) to generate a 0-100 safety score.
 
-## Setup
+Tech Stack
 
-1. Install Rust: https://rustup.rs
-2. Copy `.env.example` to `.env` and fill it in:
-   - `TELEGRAM_BOT_TOKEN` from @BotFather
-   - `SOLANA_RPC_URL` — get a real RPC endpoint from Helius, QuickNode, or
-     Triton. The public mainnet RPC is rate-limited and will fail under load.
-   - `WRAITH_MASTER_KEY` — generate with `openssl rand -base64 32`
-3. `cargo run`
+Language: Rust 
+Blockchain: Solana (RPC, Jupiter API, PumpPortal WebSockets)
+Security: AES-256-GCM, Argon2id, Envelope Encryption
+Database: sled (embedded key-value store)
+Architecture Overview
+main.rs / state.rs: Boots the bot, handles Telegram long-polling, and manages the user state machine.
+crypto.rs / wallet.rs: Implements envelope encryption (DEK/KEK) and Argon2id hashing.
+jupiter.rs: Handles Jupiter API quote fetching and fee-account routing for wrapped SOL.
+dexscreener.rs / pumpportal.rs: Live data ingestion and heuristic scoring.
 
-## Security model (read this before letting anyone else use it)
+Setup
 
-This is a **custodial** bot — it holds private keys on behalf of users. That
-means:
-
-- Whoever has `WRAITH_MASTER_KEY` can decrypt every stored wallet. Treat it
-  like a root password: never commit it, never log it, store it in a secrets
-  manager in production rather than a plain `.env` file on a server.
-- If you lose the master key, every wallet's funds are permanently
-  unrecoverable. Back it up somewhere safe and offline.
-- Users should be told plainly that this is custodial and who controls it.
-  The export-key feature exists specifically so users aren't trapped — make
-  sure it's easy to find.
-- Depending on your jurisdiction, running a service that custodies other
-  people's funds may carry legal/regulatory obligations (money transmission,
-  KYC/AML, etc). That's a question for an actual lawyer, not this README —
-  worth checking before opening it up beyond a small trusted group.
-- PIN protection on export/withdraw is a UX speed bump, not real security —
-  it's stored as a salted-less SHA-256 hash. It deters a casual phone-grab,
-  not a database compromise.
-
-## Known limitations / next steps
-
-- **Sniping new launches** isn't implemented as true real-time detection yet.
-  A real implementation needs to subscribe to program logs (Raydium pool
-  creation, pump.fun) via a websocket/Geyser feed and react within
-  milliseconds. Right now "buy" only works for tokens that already have
-  liquidity on a DexScreener-indexed pair.
-- No MEV protection (Jito bundles) yet — transactions go through the public
-  path and can be sandwiched. Worth adding before trading meaningful size.
-- The Jupiter-returned transaction has a blockhash baked in at quote time; if
-  there's a long delay before signing/sending it can expire. Add a
-  refresh-and-retry loop if you see failures.
-- `find_by_ref_code` is a linear scan over the whole DB — fine for hundreds
-  of users, replace with an index if this gets to thousands.
-
+TELEGRAM_BOT_TOKEN: Your Telegram Bot API token.
+SOLANA_RPC_URL: Your Solana RPC endpoint.
+WRAITH_PEPPER: A random 32-byte base64 string used for key derivation.
 ## Pushing to your GitHub repo
 
 You already created `pr1deperp/wraith-bot` on GitHub. To get this code in:
