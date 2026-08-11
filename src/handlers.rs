@@ -70,6 +70,11 @@ pub struct App {
     pub min_pin_length: usize,
     /// Telegram IDs that always have access, no subscription required.
     pub free_access_ids: Vec<i64>,
+    /// Monthly subscription price in lamports. Set once via
+    /// SUBSCRIPTION_SOL in .env (config.rs) -- every prompt/payment
+    /// below reads it from here, so there's no second hardcoded price
+    /// to fall out of sync with.
+    pub subscription_lamports: u64,
     sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
@@ -84,6 +89,7 @@ impl App {
         fee_wallet: String,
         min_pin_length: usize,
         free_access_ids: Vec<i64>,
+        subscription_lamports: u64,
     ) -> Self {
         Self {
             tg,
@@ -95,8 +101,21 @@ impl App {
             fee_wallet,
             min_pin_length,
             free_access_ids,
+            subscription_lamports,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Human-readable subscription price, e.g. "0.3 SOL". Used everywhere
+    /// the price is shown to a user, so the display always matches
+    /// whatever SUBSCRIPTION_SOL is actually set to.
+    fn subscription_sol_str(&self) -> String {
+        let sol = self.subscription_lamports as f64 / LAMPORTS_PER_SOL;
+        // Trim trailing zeros (e.g. "0.300" -> "0.3") without pulling in
+        // an extra formatting crate.
+        let s = format!("{sol:.9}");
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        format!("{s} SOL")
     }
 
     // ---------- trading session cache ----------
@@ -227,18 +246,20 @@ impl App {
     /// shows their wallet address/balance so they can deposit funds to pay.
     async fn send_subscribe_prompt(&self, chat_id: i64, user: &UserRecord) -> Result<()> {
         let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        let price = self.subscription_sol_str();
         self.tg.send_html(
             chat_id,
             &format!(
-                "🔒 <b>Wraith is subscription-only</b>\n\n💳 <b>1 SOL / month</b> unlocks full access — buying, selling, AI tools, alerts, everything.\n\n👛 <b>Your wallet:</b>\n<code>{}</code>\n💰 <b>Balance:</b> {balance_sol:.4} SOL\n\nDeposit at least 1 SOL (plus a little extra for network fees), then tap Subscribe below.",
+                "🔒 <b>Wraith is subscription-only</b>\n\n💳 <b>{price} / month</b> unlocks full access — buying, selling, AI tools, alerts, everything.\n\n👛 <b>Your wallet:</b>\n<code>{}</code>\n💰 <b>Balance:</b> {balance_sol:.4} SOL\n\nDeposit at least {price} (plus a little extra for network fees), then tap Subscribe below.",
                 user.pubkey
             ),
-            Some(kb::subscribe_menu()),
+            Some(kb::subscribe_menu(&price)),
         ).await?;
         Ok(())
     }
 
-    /// Sends exactly 1 SOL from the user's own wallet to `fee_wallet` and,
+    /// Sends the configured subscription price (self.subscription_lamports)
+    /// from the user's own wallet to `fee_wallet` and,
     /// on success, extends `subscription_expires_at` by 30 days (stacking
     /// on top of remaining time if they still had some left, rather than
     /// resetting to exactly 30 days from now).
@@ -255,12 +276,10 @@ impl App {
             }
         };
 
-        const SUBSCRIPTION_LAMPORTS: u64 = 1_000_000_000; // 1 SOL
-
         let blockhash_str = self.rpc.get_latest_blockhash().await?;
         let blockhash = solana_sdk::hash::Hash::from_str(&blockhash_str)?;
 
-        let instruction = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, SUBSCRIPTION_LAMPORTS);
+        let instruction = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, self.subscription_lamports);
         let mut tx = Transaction::new_with_payer(&[instruction], Some(&keypair.pubkey()));
         tx.sign(&[keypair], blockhash);
 
@@ -276,14 +295,14 @@ impl App {
                 self.db.save_user(&user)?;
                 self.tg.send_html(
                     chat_id,
-                    &format!("✅ <b>Subscribed!</b>\n\n💸 1 SOL sent.\n🔗 Tx: <code>{sig}</code>\n\nAccess renewed for 30 days."),
+                    &format!("✅ <b>Subscribed!</b>\n\n💸 {} sent.\n🔗 Tx: <code>{sig}</code>\n\nAccess renewed for 30 days.", self.subscription_sol_str()),
                     Some(kb::main_only()),
                 ).await?;
             }
             Err(e) => {
                 self.tg.send_html(
                     chat_id,
-                    &format!("❌ Payment failed: {e}\n\nMake sure your wallet has at least 1 SOL plus a bit extra for network fees, then try again."),
+                    &format!("❌ Payment failed: {e}\n\nMake sure your wallet has at least {} plus a bit extra for network fees, then try again.", self.subscription_sol_str()),
                     Some(kb::main_only()),
                 ).await?;
             }
@@ -721,7 +740,7 @@ impl App {
                 } else {
                     user.awaiting = Awaiting::VerifyingPinForSubscribe;
                     self.db.save_user(&user)?;
-                    self.tg.send_html(chat_id, "🔑 Enter your PIN to confirm your 1 SOL/month payment:", None).await?;
+                    self.tg.send_html(chat_id, &format!("🔑 Enter your PIN to confirm your {}/month payment:", self.subscription_sol_str()), None).await?;
                 }
             }
             "wallet" => {
@@ -1536,7 +1555,15 @@ impl App {
                 let already_alerted = prev.as_ref().map(|p| p.alerted).unwrap_or(false);
                 let first_seen = prev.as_ref().map(|p| p.first_seen).unwrap_or(now);
 
-                let should_alert = !already_alerted && signal.score >= 60;
+                // Only push alerts for the top tier (score >= 75, "🚀 HIGH
+                // POTENTIAL" -- see dexscreener::tier_for_score). Previously
+                // fired at >= 60, which also included "⚡ MODERATE
+                // POTENTIAL" calls -- too much noise for an unattended
+                // push notification. Users can still see moderate-tier
+                // tokens on demand via "📊 Live Signals" / "💎 AI Gem
+                // Scanner" in the menu; this only changes what gets
+                // proactively pushed to them.
+                let should_alert = !already_alerted && signal.score >= 75;
                 let _ = self.db.save_gem_snapshot(&ca, &crate::db::GemSnapshot {
                     liq_usd: liq,
                     vol_h24: vol,

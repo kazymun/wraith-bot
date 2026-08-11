@@ -24,6 +24,13 @@ pub struct Config {
     /// e.g. "123456789,987654321". Get a user's ID by having them message
     /// @userinfobot on Telegram.
     pub free_access_ids: Vec<i64>,
+    /// Monthly subscription price, in lamports. Set via SUBSCRIPTION_SOL
+    /// in .env (a decimal SOL amount, e.g. "0.3") -- defaults to 0.3 SOL
+    /// if unset. This is the only place the price is defined; every
+    /// prompt/button/payment in handlers.rs reads it from here rather
+    /// than hardcoding a number, so changing the price is a one-line
+    /// .env edit + restart, nothing else.
+    pub subscription_lamports: u64,
 }
 
 impl Config {
@@ -61,6 +68,12 @@ impl Config {
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
+        let subscription_lamports: u64 = std::env::var("SUBSCRIPTION_SOL")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|sol| *sol > 0.0)
+            .map(|sol| (sol * 1_000_000_000.0).round() as u64)
+            .unwrap_or(300_000_000); // default: 0.3 SOL
 
         // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
         // key anywhere that decrypts every user's wallet. Each user's
@@ -77,6 +90,7 @@ impl Config {
             min_pin_length,
             jupiter_api_key,
             free_access_ids,
+            subscription_lamports,
         })
     }
 }

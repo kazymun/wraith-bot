@@ -38,7 +38,8 @@ pub enum Awaiting {
     EnteringImportKey,
     EnteringCustomBuyAmount { ca: String },
     /// Waiting for the user's PIN to authorize a subscription payment
-    /// (plain SOL transfer to FEE_WALLET, see wallet::build_sol_transfer_b64).
+    /// (plain SOL transfer to FEE_WALLET, built inline in
+    /// App::do_subscribe_payment in handlers.rs).
     VerifyingPinForSubscribe,
 }
 

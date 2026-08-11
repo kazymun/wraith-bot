@@ -11,9 +11,9 @@ pub fn main_menu() -> Keyboard {
     ]
 }
 
-pub fn subscribe_menu() -> Keyboard {
+pub fn subscribe_menu(price_label: &str) -> Keyboard {
     vec![
-        vec![btn("💳 Subscribe — 1 SOL/mo", "subscribe")],
+        vec![btn(&format!("💳 Subscribe — {price_label}/mo"), "subscribe")],
         vec![btn("💰 Wallet (deposit)", "wallet"), btn("🔄 Refresh", "main")],
     ]
 }
