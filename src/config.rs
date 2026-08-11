@@ -4,6 +4,14 @@ use anyhow::{Context, Result};
 pub struct Config {
     pub telegram_token: String,
     pub rpc_url: String,
+    /// Optional backup RPC endpoint, used automatically if `rpc_url`
+    /// fails on a given call (network error, malformed response, or an
+    /// RPC-level error -- e.g. a provider hitting its monthly credit
+    /// cap and starting to return non-JSON "Unauthorized" bodies). Set
+    /// via RPC_URL_FALLBACK in .env; leave unset to run with no
+    /// fallback (single point of failure -- fine for local dev, not
+    /// recommended for anything unattended).
+    pub rpc_url_fallback: Option<String>,
     pub pepper_b64: String,
     pub db_path: String,
     pub default_slippage_bps: u32,
@@ -41,6 +49,7 @@ impl Config {
             .context("TELEGRAM_BOT_TOKEN is not set")?;
         let rpc_url = std::env::var("SOLANA_RPC_URL")
             .context("SOLANA_RPC_URL is not set")?;
+        let rpc_url_fallback = std::env::var("RPC_URL_FALLBACK").ok().filter(|s| !s.trim().is_empty());
         let pepper_b64 = std::env::var("WRAITH_PEPPER")
             .context(
                 "WRAITH_PEPPER is not set. Generate one with `openssl rand -base64 32` \
@@ -83,6 +92,7 @@ impl Config {
         Ok(Self {
             telegram_token,
             rpc_url,
+            rpc_url_fallback,
             pepper_b64,
             db_path,
             default_slippage_bps,

@@ -3,14 +3,37 @@ use serde_json::{json, Value};
 
 #[derive(Clone)]
 pub struct SolanaRpc {
-    url: String,
+    /// Tried in order on every call. urls[0] is the primary; anything
+    /// after it is a fallback used only when an earlier one fails
+    /// (auth error, rate limit, malformed response, timeout, etc). This
+    /// is what saved us on 2026-08-11 when a Helius key hit its monthly
+    /// credit cap and started returning non-JSON "Unauthorized" bodies --
+    /// with only one URL configured, every single RPC call in the bot
+    /// (balances, quotes, swaps, blockhash) failed until the cap reset.
+    urls: Vec<String>,
     http: reqwest::Client,
 }
 
 impl SolanaRpc {
+    /// Back-compat constructor: single URL, no fallback. Prefer
+    /// `SolanaRpc::with_fallback` for anything running unattended.
     pub fn new(url: String) -> Self {
+        Self::with_fallback(url, None)
+    }
+
+    /// `primary` is tried first on every call; `fallback`, if given, is
+    /// tried only when the primary call fails for any reason. Both
+    /// providers should point at Solana mainnet -- this is not for
+    /// mainnet/devnet switching, only for provider redundancy.
+    pub fn with_fallback(primary: String, fallback: Option<String>) -> Self {
+        let mut urls = vec![primary];
+        if let Some(f) = fallback {
+            if !f.trim().is_empty() {
+                urls.push(f);
+            }
+        }
         Self {
-            url,
+            urls,
             // Forced to HTTP/1.1 -- see telegram.rs for why (ALPN/h2
             // negotiation on some RPC providers was surfacing as
             // "invalid HTTP version parsed").
@@ -21,6 +44,12 @@ impl SolanaRpc {
         }
     }
 
+    /// Tries each configured URL in order, returning the first success.
+    /// Only moves on to the next URL after a call fully fails (network
+    /// error, non-JSON body, or an explicit RPC-level "error" field) --
+    /// a successful-but-empty result is NOT treated as failure, so this
+    /// never silently masks "this pubkey has no token accounts" as
+    /// "provider is down".
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -28,13 +57,40 @@ impl SolanaRpc {
             "method": method,
             "params": params
         });
-        let resp: Value = self.http.post(&self.url).json(&body).send().await?.json().await?;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for (i, url) in self.urls.iter().enumerate() {
+            let attempt = self.try_one(url, &body).await;
+            match attempt {
+                Ok(value) => {
+                    if i > 0 {
+                        eprintln!("⚠️ RPC: primary failed, succeeded on fallback #{i} for {method}");
+                    }
+                    return Ok(value);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("RPC call to {method} failed: no endpoints configured")))
+    }
+
+    async fn try_one(&self, url: &str, body: &Value) -> Result<Value> {
+        let resp: Value = self
+            .http
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("RPC request failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| anyhow!("RPC response wasn't valid JSON (provider may be down or over quota): {e}"))?;
         if let Some(err) = resp.get("error") {
-            return Err(anyhow!("RPC error on {method}: {err}"));
+            return Err(anyhow!("RPC error: {err}"));
         }
         resp.get("result")
             .cloned()
-            .ok_or_else(|| anyhow!("RPC response for {method} had no result field"))
+            .ok_or_else(|| anyhow!("RPC response had no result field"))
     }
 
     pub async fn get_balance_lamports(&self, pubkey: &str) -> Result<u64> {

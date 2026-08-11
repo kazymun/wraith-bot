@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
         TgClient::new(cfg.telegram_token.clone()),
         Db::open(&cfg.db_path)?,
         Crypto::new(&cfg.pepper_b64)?,
-        SolanaRpc::new(cfg.rpc_url.clone()),
+        SolanaRpc::with_fallback(cfg.rpc_url.clone(), cfg.rpc_url_fallback.clone()),
         Jupiter::new(cfg.jupiter_api_key.clone()),
         cfg.default_slippage_bps,
         cfg.fee_wallet.clone(),
