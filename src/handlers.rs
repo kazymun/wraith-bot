@@ -120,11 +120,16 @@ impl App {
 
     // ---------- trading session cache ----------
 
-    /// Whether this user currently has access -- either an active paid
-    /// subscription, or their Telegram ID is on the free-access allowlist
-    /// (friends/testers, set via FREE_ACCESS_IDS).
+    /// Whether this user currently has access. Three ways in:
+    /// 1. The paywall is disabled entirely (SUBSCRIPTION_SOL=0 in .env) --
+    ///    everyone gets access, no payment required, no subscribe prompt
+    ///    ever shown. This is the current setting.
+    /// 2. Their Telegram ID is on the free-access allowlist (FREE_ACCESS_IDS).
+    /// 3. They have an active paid subscription.
     fn has_access(&self, user: &UserRecord) -> bool {
-        self.free_access_ids.contains(&user.telegram_id) || user.subscription_expires_at > crate::state::chrono_now()
+        self.subscription_lamports == 0
+            || self.free_access_ids.contains(&user.telegram_id)
+            || user.subscription_expires_at > crate::state::chrono_now()
     }
 
     fn session_keypair(&self, telegram_id: i64) -> Option<Keypair> {
