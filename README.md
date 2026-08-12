@@ -41,3 +41,4 @@ git push
 ```
 
 Make sure `.env` is never committed — add it to `.gitignore` (see below).
+# deploy trigger Wed Aug 12 09:17:22 +07 2026
