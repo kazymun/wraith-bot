@@ -1,7 +1,7 @@
 use crate::crypto::Crypto;
 use crate::db::Db;
 use crate::dexscreener;
-use crate::jupiter::{out_amount, price_impact_pct, Jupiter, SOL_MINT};
+use crate::jupiter::{out_amount, price_impact_pct, Jupiter, JITO_SOL_MINT, SOL_MINT};
 use crate::keyboards as kb;
 use crate::pumpportal::PumpEvent;
 use crate::rpc::SolanaRpc;
@@ -79,6 +79,9 @@ pub struct App {
     /// inclusion. See config.rs (MAX_PRIORITY_FEE_SOL) and jupiter.rs
     /// (get_swap_transaction) for how this is actually used.
     pub max_priority_fee_lamports: u64,
+    /// Cut of staking GAINS ONLY (never principal) taken on unstake, in
+    /// basis points. See config.rs (YIELD_FEE_BPS) and execute_unstake.
+    pub yield_fee_bps: u32,
     sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
@@ -95,6 +98,7 @@ impl App {
         free_access_ids: Vec<i64>,
         subscription_lamports: u64,
         max_priority_fee_lamports: u64,
+        yield_fee_bps: u32,
     ) -> Self {
         Self {
             tg,
@@ -108,6 +112,7 @@ impl App {
             free_access_ids,
             subscription_lamports,
             max_priority_fee_lamports,
+            yield_fee_bps,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -645,6 +650,56 @@ impl App {
                 }
             }
 
+            Awaiting::EnteringCustomStakeAmount => {
+                user.awaiting = Awaiting::None;
+                self.db.save_user(&user)?;
+                match text.parse::<f64>() {
+                    Ok(amount) if amount > 0.0 => {
+                        let data = format!("yieldamt_{amount}");
+                        self.handle_yield_amount(chat_id, telegram_id, &data).await?;
+                    }
+                    _ => {
+                        self.tg.send_html(chat_id, "❌ Invalid amount. Please enter a number like <code>0.5</code>", Some(kb::main_only())).await?;
+                    }
+                }
+            }
+
+            Awaiting::VerifyingPinForStake { amount_sol } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.store_session(telegram_id, &kp);
+                        self.execute_stake(chat_id, &mut user, &kp, amount_sol).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
+                }
+            }
+
+            Awaiting::VerifyingPinForUnstake => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                match self.try_pin(&mut user, &text)? {
+                    Some(kp) => {
+                        user.awaiting = Awaiting::None;
+                        self.db.save_user(&user)?;
+                        self.store_session(telegram_id, &kp);
+                        self.execute_unstake(chat_id, &mut user, &kp).await?;
+                    }
+                    None => {
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
+                }
+            }
+
             Awaiting::None => {}
         }
 
@@ -831,6 +886,31 @@ impl App {
             }
             "referral" => {
                 self.tg.send_html(chat_id, "👥 <b>Referral Program</b>\n\nComing soon.", Some(kb::main_only())).await?;
+            }
+            "yield" => {
+                self.show_yield_menu(chat_id, &user).await?;
+            }
+            "yield_unstake" => {
+                if let Some(kp) = self.session_keypair(telegram_id) {
+                    self.execute_unstake(chat_id, &mut user, &kp).await?;
+                } else {
+                    if let Some(m) = lockout_message(&user) {
+                        self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
+                        return Ok(());
+                    }
+                    user.awaiting = Awaiting::VerifyingPinForUnstake;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "🔑 Enter your PIN to confirm unstaking:", Some(kb::cancel_to("main"))).await?;
+                }
+            }
+            other if other.starts_with("yieldamt_") => {
+                if other.ends_with("_custom") {
+                    user.awaiting = Awaiting::EnteringCustomStakeAmount;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "✏️ Enter the amount of SOL you want to stake (e.g. <code>2.5</code>):", Some(kb::cancel_to("main"))).await?;
+                } else {
+                    self.handle_yield_amount(chat_id, telegram_id, other).await?;
+                }
             }
             other if other.starts_with("bcp_") => {
                 // Quick buy from gem/pump alerts. Uses a short "bcp_" prefix
@@ -1144,6 +1224,190 @@ impl App {
         Ok(())
     }
 
+    /// Shows current yield status (staked value, principal, unrealized
+    /// gain if any) plus the stake/unstake keyboard. The "current value"
+    /// figure is a live Jupiter quote for the user's full JitoSOL
+    /// balance -- an estimate, same as any other quote-based price shown
+    /// elsewhere in the bot, not a guaranteed execution price.
+    async fn show_yield_menu(&self, chat_id: i64, user: &UserRecord) -> Result<()> {
+        let (jito_raw, _decimals) = self.rpc.get_token_balance(&user.pubkey, JITO_SOL_MINT).await.unwrap_or((0, 9));
+        let principal_sol = user.yield_principal_lamports as f64 / LAMPORTS_PER_SOL;
+
+        if jito_raw == 0 {
+            self.tg.send_html(
+                chat_id,
+                "🌱 <b>Yield (JitoSOL staking)</b>\n\nStake idle SOL into JitoSOL and earn Solana staking rewards automatically -- no separate claim step, the value just grows.\n\nWraith takes a cut ONLY of the gains when you unstake -- never your principal.\n\nHow much do you want to stake?",
+                Some(kb::yield_menu(false)),
+            ).await?;
+            return Ok(());
+        }
+
+        let est_value_sol = match self.jup.get_quote(JITO_SOL_MINT, SOL_MINT, jito_raw, 100).await {
+            Ok(q) => out_amount(&q).unwrap_or(0) as f64 / LAMPORTS_PER_SOL,
+            Err(_) => 0.0,
+        };
+        let gain_sol = (est_value_sol - principal_sol).max(0.0);
+        let fee_pct = self.yield_fee_bps as f64 / 100.0;
+
+        self.tg.send_html(
+            chat_id,
+            &format!(
+                "🌱 <b>Yield (JitoSOL staking)</b>\n\n💰 Principal staked: {principal_sol:.4} SOL\n📈 Current est. value: {est_value_sol:.4} SOL\n✨ Unrealized gain: {gain_sol:.4} SOL\n\nUnstaking takes {fee_pct:.1}% of the gain only -- your principal is never touched. Stake more, or unstake everything:"
+            ),
+            Some(kb::yield_menu(true)),
+        ).await?;
+        Ok(())
+    }
+
+    async fn handle_yield_amount(&self, chat_id: i64, telegram_id: i64, data: &str) -> Result<()> {
+        // format: yieldamt_<amount>
+        let amount_sol: f64 = data.trim_start_matches("yieldamt_").parse().unwrap_or(0.0);
+        if amount_sol <= 0.0 {
+            self.tg.send_html(chat_id, "❌ Invalid amount.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+        let mut user = self.get_or_create_user(telegram_id)?;
+
+        // Leave a small buffer beyond the stake amount for network/priority
+        // fees on the swap itself, same margin do_withdraw already uses
+        // for the same reason.
+        let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        if balance_sol < amount_sol + 0.01 {
+            self.tg.send_html(chat_id, &format!("❌ Insufficient balance. You have {balance_sol:.4} SOL, need at least {:.4} SOL ({amount_sol} SOL to stake + network fees).", amount_sol + 0.01), Some(kb::main_only())).await?;
+            return Ok(());
+        }
+
+        if let Some(kp) = self.session_keypair(telegram_id) {
+            self.execute_stake(chat_id, &mut user, &kp, amount_sol).await?;
+        } else {
+            if let Some(m) = lockout_message(&user) {
+                self.tg.send_html(chat_id, &m, Some(kb::main_only())).await?;
+                return Ok(());
+            }
+            user.awaiting = Awaiting::VerifyingPinForStake { amount_sol };
+            self.db.save_user(&user)?;
+            self.tg.send_html(chat_id, "🔑 Enter your PIN to unlock trading (stays unlocked for 15 minutes):", Some(kb::cancel_to("main"))).await?;
+        }
+        Ok(())
+    }
+
+    /// Swaps `amount_sol` of the user's own SOL into JitoSOL. No platform
+    /// trading fee applies here (fee_wallet="") -- this is the user
+    /// moving their own money into yield, not a trade; the only fee on
+    /// this feature is the gains-only cut taken in execute_unstake.
+    async fn execute_stake(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, amount_sol: f64) -> Result<()> {
+        self.tg.send_html(chat_id, "⚡ Getting quote and staking...", None).await?;
+
+        let lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
+        let quote = match self.jup.get_quote(SOL_MINT, JITO_SOL_MINT, lamports, 100).await {
+            Ok(q) => q,
+            Err(e) => {
+                self.tg.send_html(chat_id, &format!("❌ Couldn't get a stake quote: {e}"), Some(kb::main_only())).await?;
+                return Ok(());
+            }
+        };
+
+        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, "").await {
+            Ok(sig) => {
+                user.yield_principal_lamports = user.yield_principal_lamports.saturating_add(lamports);
+                self.db.save_user(user)?;
+                self.tg.send_html(chat_id, &format!(
+                    "✅ <b>Staked</b>\n\n💸 {amount_sol} SOL -> JitoSOL\n🔗 Tx: <code>{sig}</code>\n\nYour rewards accrue automatically -- check 🌱 Yield anytime to see current value."
+                ), Some(kb::main_only())).await?;
+            }
+            Err(e) => {
+                self.tg.send_html(chat_id, &format!("❌ Stake failed: {e}"), Some(kb::main_only())).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Swaps the user's ENTIRE JitoSOL balance back to SOL, then -- only
+    /// if that came back to MORE than the tracked principal (an actual
+    /// gain) -- sends `yield_fee_bps` of just that gain to the platform
+    /// fee wallet as a second, separate transaction. Principal is never
+    /// touched: if the estimated value came back at or below principal
+    /// (e.g. an extreme slashing scenario, or a quote that moved against
+    /// the user), no fee is taken at all.
+    async fn execute_unstake(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair) -> Result<()> {
+        let (jito_raw, _decimals) = match self.rpc.get_token_balance(&user.pubkey, JITO_SOL_MINT).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.tg.send_html(chat_id, &format!("❌ Couldn't check your JitoSOL balance: {e}"), Some(kb::main_only())).await?;
+                return Ok(());
+            }
+        };
+        if jito_raw == 0 {
+            self.tg.send_html(chat_id, "❌ You don't have anything staked.", Some(kb::main_only())).await?;
+            return Ok(());
+        }
+
+        self.tg.send_html(chat_id, "⚡ Getting quote and unstaking...", None).await?;
+
+        let quote = match self.jup.get_quote(JITO_SOL_MINT, SOL_MINT, jito_raw, 100).await {
+            Ok(q) => q,
+            Err(e) => {
+                self.tg.send_html(chat_id, &format!("❌ Couldn't get an unstake quote: {e}"), Some(kb::main_only())).await?;
+                return Ok(());
+            }
+        };
+        let out_lamports = out_amount(&quote).unwrap_or(0);
+
+        let sig = match self.sign_and_send_swap(keypair, &user.pubkey, &quote, "").await {
+            Ok(sig) => sig,
+            Err(e) => {
+                self.tg.send_html(chat_id, &format!("❌ Unstake failed: {e}"), Some(kb::main_only())).await?;
+                return Ok(());
+            }
+        };
+
+        let principal_lamports = user.yield_principal_lamports;
+        let gain_lamports = out_lamports.saturating_sub(principal_lamports);
+        let mut fee_note = String::new();
+
+        if gain_lamports > 0 && !self.fee_wallet.is_empty() {
+            let fee_lamports = ((gain_lamports as u128) * self.yield_fee_bps as u128 / 10_000) as u64;
+            if fee_lamports > 0 {
+                if let Ok(dest_pubkey) = Pubkey::from_str(&self.fee_wallet) {
+                    match self.rpc.get_latest_blockhash().await {
+                        Ok(blockhash_str) => {
+                            if let Ok(blockhash) = solana_sdk::hash::Hash::from_str(&blockhash_str) {
+                                let instruction = system_instruction::transfer(&keypair.pubkey(), &dest_pubkey, fee_lamports);
+                                let mut tx = Transaction::new_with_payer(&[instruction], Some(&keypair.pubkey()));
+                                tx.sign(&[keypair], blockhash);
+                                if let Ok(tx_bytes) = bincode::serialize(&tx) {
+                                    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tx_bytes);
+                                    match self.rpc.send_raw_transaction_b64(&tx_b64).await {
+                                        Ok(_) => {
+                                            let fee_sol = fee_lamports as f64 / LAMPORTS_PER_SOL;
+                                            let fee_pct = self.yield_fee_bps as f64 / 100.0;
+                                            fee_note = format!("\n💵 Yield fee ({fee_pct:.1}% of gain): {fee_sol:.4} SOL");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("⚠️ Yield fee transfer failed after successful unstake (principal+gains still fully belong to user): {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("⚠️ Couldn't fetch blockhash for yield fee transfer: {e}"),
+                    }
+                }
+            }
+        }
+
+        user.yield_principal_lamports = 0;
+        self.db.save_user(user)?;
+
+        let out_sol = out_lamports as f64 / LAMPORTS_PER_SOL;
+        let principal_sol = principal_lamports as f64 / LAMPORTS_PER_SOL;
+        let gain_sol = gain_lamports as f64 / LAMPORTS_PER_SOL;
+        self.tg.send_html(chat_id, &format!(
+            "✅ <b>Unstaked</b>\n\n💰 Received: {out_sol:.4} SOL\n📥 Principal: {principal_sol:.4} SOL\n✨ Gain: {gain_sol:.4} SOL{fee_note}\n🔗 Tx: <code>{sig}</code>"
+        ), Some(kb::main_only())).await?;
+        Ok(())
+    }
+
     async fn execute_buy(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str, amount_sol: f64) -> Result<()> {
         self.tg.send_html(chat_id, "⚡ Getting quote...", None).await?;
 
@@ -1168,7 +1432,7 @@ impl App {
 
         self.tg.send_html(chat_id, "⚡ Executing swap...", None).await?;
 
-        match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
+        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, &self.fee_wallet).await {
             Ok(sig) => {
                 let est_out_raw = out_amount(&quote).unwrap_or(0);
 
@@ -1250,7 +1514,7 @@ impl App {
 
         self.log_platform_fee(&quote, "sell");
 
-        match self.sign_and_send_swap(keypair, &user.pubkey, &quote).await {
+        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, &self.fee_wallet).await {
             Ok(sig) => {
                 let est_out_sol = out_amount(&quote).unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 let human_amount = sell_raw as f64 / 10f64.powi(decimals as i32);
@@ -1310,8 +1574,13 @@ impl App {
         }
     }
 
-    async fn sign_and_send_swap(&self, keypair: &Keypair, pubkey: &str, quote: &serde_json::Value) -> Result<String> {
-        let swap_tx_b64 = self.jup.get_swap_transaction(quote, pubkey, &self.fee_wallet, self.max_priority_fee_lamports).await?;
+    /// `fee_wallet`: pass `&self.fee_wallet` for user-initiated trades
+    /// (buy/sell -- takes the 0.75% platform fee), or `""` for the bot
+    /// moving a user's own money into/out of yield -- that's not a trade,
+    /// so no trading fee applies there (the yield fee, taken separately
+    /// in execute_unstake, is the only cut on that flow).
+    async fn sign_and_send_swap(&self, keypair: &Keypair, pubkey: &str, quote: &serde_json::Value, fee_wallet: &str) -> Result<String> {
+        let swap_tx_b64 = self.jup.get_swap_transaction(quote, pubkey, fee_wallet, self.max_priority_fee_lamports).await?;
 
         let tx_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, swap_tx_b64)?;
         let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;

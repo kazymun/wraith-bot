@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.free_access_ids.clone(),
         cfg.subscription_lamports,
         cfg.max_priority_fee_lamports,
+        cfg.yield_fee_bps,
     );
 
     // Verify the platform fee wallet's wrapped-SOL token account actually

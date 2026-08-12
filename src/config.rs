@@ -49,6 +49,10 @@ pub struct Config {
     /// launch without silently eating a large chunk of a small trade.
     /// Set to "0" to disable priority fees entirely (cheapest, slowest).
     pub max_priority_fee_lamports: u64,
+    /// Cut Wraith takes of STAKING GAINS ONLY (never principal) when a
+    /// user unstakes from the built-in JitoSOL yield feature, in basis
+    /// points. Set via YIELD_FEE_BPS in .env. Defaults to 1000 (10%).
+    pub yield_fee_bps: u32,
 }
 
 impl Config {
@@ -99,6 +103,10 @@ impl Config {
             .filter(|sol| *sol >= 0.0)
             .map(|sol| (sol * 1_000_000_000.0).round() as u64)
             .unwrap_or(3_000_000); // default: 0.003 SOL
+        let yield_fee_bps: u32 = std::env::var("YIELD_FEE_BPS")
+            .unwrap_or_else(|_| "1000".to_string())
+            .parse()
+            .unwrap_or(1000); // default: 10%
 
         // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
         // key anywhere that decrypts every user's wallet. Each user's
@@ -118,6 +126,7 @@ impl Config {
             free_access_ids,
             subscription_lamports,
             max_priority_fee_lamports,
+            yield_fee_bps,
         })
     }
 }

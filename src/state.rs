@@ -41,6 +41,13 @@ pub enum Awaiting {
     /// (plain SOL transfer to FEE_WALLET, built inline in
     /// App::do_subscribe_payment in handlers.rs).
     VerifyingPinForSubscribe,
+    /// Waiting for the user's PIN to authorize a stake (SOL -> JitoSOL).
+    VerifyingPinForStake { amount_sol: f64 },
+    /// Waiting for the user's PIN to authorize a full unstake
+    /// (JitoSOL -> SOL, with the yield fee skimmed off any gain).
+    VerifyingPinForUnstake,
+    /// User tapped "✏️ Custom SOL" on the yield/stake keyboard.
+    EnteringCustomStakeAmount,
 }
 
 impl Default for Awaiting {
@@ -139,6 +146,14 @@ pub struct UserRecord {
     /// before allowing any bot functionality.
     #[serde(default)]
     pub subscription_expires_at: i64,
+    /// Total SOL (lamports) currently committed to the yield feature --
+    /// i.e. what was actually spent buying the JitoSOL currently held.
+    /// This is the cost basis: at unstake time, gain = SOL received minus
+    /// this value, and only that gain (never this principal) is subject
+    /// to the yield fee. Reset to 0 after a full unstake. 0 means "not
+    /// currently staked."
+    #[serde(default)]
+    pub yield_principal_lamports: u64,
 }
 
 impl UserRecord {
@@ -157,6 +172,7 @@ impl UserRecord {
             gem_alerts: true,
             known_withdraw_addresses: vec![],
             subscription_expires_at: 0,
+            yield_principal_lamports: 0,
         }
     }
 }

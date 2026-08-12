@@ -4,6 +4,12 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
 pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+/// JitoSOL -- Jito's liquid staking token. Verified independently against
+/// Solana Explorer, Solscan, and Jito's own docs before hardcoding (a
+/// wrong mint here would misroute real user funds). 9 decimals, same as
+/// SOL. Its SOL value rises over time as staking rewards accrue -- there's
+/// no separate "claim rewards" step, the exchange rate itself grows.
+pub const JITO_SOL_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
 
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";

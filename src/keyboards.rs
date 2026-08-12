@@ -7,6 +7,7 @@ pub fn main_menu() -> Keyboard {
         vec![btn("🟢 Buy", "buy"), btn("🔴 Sell", "sell")],
         vec![btn("🤖 AI Tools", "ai_tools"), btn("👥 Referral", "referral")],
         vec![btn("📈 PnL", "pnl"), btn("⚙️ Settings", "settings")],
+        vec![btn("🌱 Yield", "yield")],
         vec![btn("🔄 Refresh", "refresh")],
     ]
 }
@@ -16,6 +17,25 @@ pub fn subscribe_menu(price_label: &str) -> Keyboard {
         vec![btn(&format!("💳 Subscribe — {price_label}/mo"), "subscribe")],
         vec![btn("💰 Wallet (deposit)", "wallet"), btn("🔄 Refresh", "main")],
     ]
+}
+
+/// Amount-selection + unstake keyboard for the yield feature. `has_stake`
+/// controls whether "Unstake All" appears (no point showing it if the
+/// user has nothing currently staked).
+pub fn yield_menu(has_stake: bool) -> Keyboard {
+    let mut kb: Keyboard = vec![
+        vec![
+            btn("0.5 SOL", "yieldamt_0.5"),
+            btn("1 SOL", "yieldamt_1"),
+            btn("5 SOL", "yieldamt_5"),
+        ],
+        vec![btn("✏️ Custom SOL", "yieldamt_custom")],
+    ];
+    if has_stake {
+        kb.push(vec![btn("💸 Unstake All", "yield_unstake")]);
+    }
+    kb.push(vec![btn("🏠 Main Menu", "main")]);
+    kb
 }
 
 pub fn cancel_to(target: &str) -> Keyboard {
