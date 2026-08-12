@@ -129,13 +129,45 @@ impl Jupiter {
     /// output on sells), the WSOL fee account is always valid -- no
     /// direction check needed. (A prior "fix" here restricted this to
     /// buys only, based on a misreading of Jupiter's docs -- reverted.)
-    pub async fn get_swap_transaction(&self, quote: &Value, user_pubkey: &str, fee_wallet: &str) -> Result<String> {
+    ///
+    /// `max_priority_fee_lamports`: caps what Jupiter's "auto" priority-fee
+    /// mode is allowed to spend bidding for faster inclusion in a block.
+    /// This is the real lever for "landing before other traders" during a
+    /// busy launch -- validators prioritize transactions offering a higher
+    /// fee when a block is contested. It is NOT front-running or private
+    /// mempool access (Solana doesn't have a public mempool the way
+    /// Ethereum does) -- it's simply outbidding other *ordinary* traders
+    /// for block space, which is the standard, legitimate mechanism every
+    /// wallet/bot on Solana uses to compete for speed. Set to 0 to disable
+    /// (transaction lands at whatever base fee, cheapest but slowest under
+    /// congestion).
+    pub async fn get_swap_transaction(
+        &self,
+        quote: &Value,
+        user_pubkey: &str,
+        fee_wallet: &str,
+        max_priority_fee_lamports: u64,
+    ) -> Result<String> {
         let url = format!("{}/swap", self.base_url());
         let mut body = serde_json::json!({
             "quoteResponse": quote,
             "userPublicKey": user_pubkey,
             "wrapAndUnwrapSol": true,
+            // Jupiter estimates compute units actually needed instead of
+            // reserving the max -- slightly cheaper and, more importantly
+            // here, lets the "auto" priority fee below concentrate its
+            // budget on priority (speed) rather than padding for unused
+            // compute headroom.
+            "dynamicComputeUnitLimit": true,
         });
+        if max_priority_fee_lamports > 0 {
+            body["prioritizationFeeLamports"] = serde_json::json!({
+                "priorityLevelWithMaxLamports": {
+                    "priorityLevel": "veryHigh",
+                    "maxLamports": max_priority_fee_lamports
+                }
+            });
+        }
         if !fee_wallet.is_empty() {
             let fee_account = derive_wsol_fee_account(fee_wallet)?;
             body["feeAccount"] = serde_json::json!(fee_account);

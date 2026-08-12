@@ -41,6 +41,14 @@ pub struct Config {
     /// handlers.rs reads it from here, so changing it later is a
     /// one-line .env edit + restart, nothing else.
     pub subscription_lamports: u64,
+    /// Max lamports Jupiter's dynamic priority-fee mode may spend per
+    /// swap bidding for faster block inclusion (see jupiter.rs for how
+    /// this works). Set via MAX_PRIORITY_FEE_SOL in .env (decimal SOL,
+    /// e.g. "0.005"). Defaults to 0.003 SOL (~$0.50-$1 depending on SOL
+    /// price) if unset -- enough to meaningfully help during a busy
+    /// launch without silently eating a large chunk of a small trade.
+    /// Set to "0" to disable priority fees entirely (cheapest, slowest).
+    pub max_priority_fee_lamports: u64,
 }
 
 impl Config {
@@ -85,6 +93,12 @@ impl Config {
             .filter(|sol| *sol >= 0.0)
             .map(|sol| (sol * 1_000_000_000.0).round() as u64)
             .unwrap_or(0); // default: free (no subscription required)
+        let max_priority_fee_lamports: u64 = std::env::var("MAX_PRIORITY_FEE_SOL")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|sol| *sol >= 0.0)
+            .map(|sol| (sol * 1_000_000_000.0).round() as u64)
+            .unwrap_or(3_000_000); // default: 0.003 SOL
 
         // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
         // key anywhere that decrypts every user's wallet. Each user's
@@ -103,6 +117,7 @@ impl Config {
             jupiter_api_key,
             free_access_ids,
             subscription_lamports,
+            max_priority_fee_lamports,
         })
     }
 }

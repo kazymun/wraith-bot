@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.min_pin_length,
         cfg.free_access_ids.clone(),
         cfg.subscription_lamports,
+        cfg.max_priority_fee_lamports,
     );
 
     // Verify the platform fee wallet's wrapped-SOL token account actually
