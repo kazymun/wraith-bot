@@ -75,6 +75,10 @@ pub struct App {
     /// below reads it from here, so there's no second hardcoded price
     /// to fall out of sync with.
     pub subscription_lamports: u64,
+    /// Max lamports Jupiter may spend per-swap bidding for faster block
+    /// inclusion. See config.rs (MAX_PRIORITY_FEE_SOL) and jupiter.rs
+    /// (get_swap_transaction) for how this is actually used.
+    pub max_priority_fee_lamports: u64,
     sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
@@ -90,6 +94,7 @@ impl App {
         min_pin_length: usize,
         free_access_ids: Vec<i64>,
         subscription_lamports: u64,
+        max_priority_fee_lamports: u64,
     ) -> Self {
         Self {
             tg,
@@ -102,6 +107,7 @@ impl App {
             min_pin_length,
             free_access_ids,
             subscription_lamports,
+            max_priority_fee_lamports,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1305,7 +1311,7 @@ impl App {
     }
 
     async fn sign_and_send_swap(&self, keypair: &Keypair, pubkey: &str, quote: &serde_json::Value) -> Result<String> {
-        let swap_tx_b64 = self.jup.get_swap_transaction(quote, pubkey, &self.fee_wallet).await?;
+        let swap_tx_b64 = self.jup.get_swap_transaction(quote, pubkey, &self.fee_wallet, self.max_priority_fee_lamports).await?;
 
         let tx_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, swap_tx_b64)?;
         let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
