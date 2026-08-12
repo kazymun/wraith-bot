@@ -106,7 +106,7 @@ impl Jupiter {
                 ("outputMint", output_mint),
                 ("amount", &amount.to_string()),
                 ("slippageBps", &slippage_bps.to_string()),
-                ("platformFeeBps", "50"),
+                ("platformFeeBps", "75"), // 0.75% -- see fee_wallet in config.rs for where this gets collected
             ]);
         let resp = self.add_api_key(req).send().await?;
 
@@ -119,7 +119,7 @@ impl Jupiter {
 
     /// Takes a quote response and returns the base64-encoded unsigned
     /// (versioned) transaction ready to be signed by the user's keypair.
-    /// fee_wallet: if non-empty, Jupiter will route 0.5% to the wrapped-SOL
+    /// fee_wallet: if non-empty, Jupiter will route 0.75% to the wrapped-SOL
     /// token account derived from this address (NOT to the raw address
     /// itself -- see `derive_wsol_fee_account` for why).
     ///
