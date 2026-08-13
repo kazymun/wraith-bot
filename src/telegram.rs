@@ -105,19 +105,17 @@ impl TgClient {
     pub fn new(token: String) -> Self {
         Self {
             token,
-            // Forced to HTTP/1.1. This has flip-flopped before (see git
-            // history) because the right setting is genuinely
-            // network-dependent: some hosts choke on auto-negotiated
-            // HTTP/2 and need this forced; a couple others apparently hit
-            // "invalid HTTP version parsed" specifically WHEN this was
-            // forced, and were fine without it. If you deploy somewhere
-            // and immediately see "invalid HTTP version parsed" on every
-            // request, that's this setting fighting your network's
-            // proxy/ALPN handling -- try toggling it (verify with a raw
-            // `openssl s_client` request first, same as we did to confirm
-            // this direction was right for the current deployment target).
+            // NOTE: previously forced to HTTP/1.1 to work around an
+            // "invalid HTTP version parsed" error some deployments hit
+            // during ALPN/h2 negotiation. On other networks that forced
+            // downgrade is itself what triggers the same error (curl on
+            // the same machine negotiates HTTP/2 with Telegram cleanly).
+            // Letting reqwest auto-negotiate (its default) works for
+            // both cases -- if you hit "invalid HTTP version parsed"
+            // again on some future host, that's a local network/proxy
+            // issue to chase, not something to paper over by forcing a
+            // specific HTTP version here.
             http: reqwest::Client::builder()
-                .http1_only()
                 .build()
                 .expect("failed to build reqwest client"),
         }
@@ -127,6 +125,17 @@ impl TgClient {
         format!("https://api.telegram.org/bot{}/{}", self.token, method)
     }
 
+    /// IMPORTANT: unlike a "just show nothing happened yet" no-op, an
+    /// invalid/revoked bot token makes Telegram return `{"ok": false,
+    /// "error_code": 401, ...}` here -- and until this fix, that response
+    /// was silently treated as "no new messages" (`resp.result` is `None`
+    /// on a failed call, and `.unwrap_or_default()` turned that into an
+    /// empty `Vec` with no error at all). That made a dead token
+    /// indistinguishable from a perfectly healthy, quiet bot: clean
+    /// startup logs, no errors anywhere, and zero messages ever
+    /// delivered. Now this actually checks `ok` and returns `Err`, so
+    /// main.rs's existing "Failed to get updates: {e}" logging catches
+    /// it loudly instead of hiding it forever.
     pub async fn get_updates(&self, offset: i64) -> Result<Vec<TgUpdate>> {
         let resp: TgResponse<Vec<TgUpdate>> = self
             .http
@@ -138,6 +147,10 @@ impl TgClient {
             .json()
             .await
             .map_err(|e| self.redact_chain(&e))?;
+        if !resp.ok {
+            let desc = resp.description.unwrap_or_else(|| "unknown error".to_string());
+            return Err(anyhow!("getUpdates failed: {desc} -- check TELEGRAM_BOT_TOKEN is valid and not revoked"));
+        }
         Ok(resp.result.unwrap_or_default())
     }
 
