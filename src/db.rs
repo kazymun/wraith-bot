@@ -1,5 +1,5 @@
 use crate::crypto::EnvelopeSecret;
-use crate::state::{Awaiting, PinLockout, Position, UserRecord};
+use crate::state::{Awaiting, PinLockout, Position, UserRecord, WalletSlot};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
@@ -105,28 +105,72 @@ impl Db {
     }
 
     /// Rebuilds a UserRecord field-by-field from raw JSON, tolerating any
-    /// field that has changed shape or gone missing -- EXCEPT `pubkey` and
-    /// `secret`, which are the only two fields that actually matter for
-    /// "does this user still own their wallet". If either of those can't
-    /// be read, we refuse to recover (better to stay broken than guess).
-    /// Everything else (awaiting/settings/positions/etc) falls back to a
-    /// safe default if it can't be parsed -- losing "what were we waiting
-    /// for the user to type next" is annoying, never fund-affecting.
+    /// field that has changed shape or gone missing -- EXCEPT the wallet
+    /// data itself (pubkey + secret), which is the only thing that
+    /// actually matters for "does this user still own their wallet". If
+    /// that can't be read, we refuse to recover (better to stay broken
+    /// than guess). Everything else (awaiting/settings/refs/etc) falls
+    /// back to a safe default if it can't be parsed -- losing "what were
+    /// we waiting for the user to type next" is annoying, never
+    /// fund-affecting.
+    ///
+    /// This is ALSO how old single-wallet records (from before the
+    /// multi-wallet rebuild -- one flat `pubkey`/`secret`/`positions`/
+    /// `yield_principal_lamports` on the record itself, no `wallets`
+    /// array) get migrated forward: the new `UserRecord` shape requires a
+    /// `wallets` array that old records don't have, so `serde_json::from_slice`
+    /// fails on them and `get_user` routes them into this function same as
+    /// any other "failed to parse" case. We detect which shape we're
+    /// looking at and build the right thing either way -- so this
+    /// function is doing double duty as both corruption-recovery AND
+    /// schema migration, and callers don't need to know or care which.
     fn recover_user_record(telegram_id: i64, bytes: &[u8]) -> Option<UserRecord> {
         let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
 
-        let pubkey = v.get("pubkey")?.as_str()?.to_string();
-        let secret: EnvelopeSecret = serde_json::from_value(v.get("secret")?.clone()).ok()?;
+        let wallets: Vec<WalletSlot> = if let Some(w) = v.get("wallets") {
+            // Already new-shape (e.g. corrupted in some OTHER field after
+            // the multi-wallet upgrade) -- parse it directly. If the
+            // wallets array itself is unparseable we refuse to recover,
+            // same "don't guess" rule as the legacy pubkey/secret case
+            // below.
+            serde_json::from_value(w.clone()).ok()?
+        } else {
+            // Old single-wallet shape: pubkey/secret/positions/
+            // yield_principal_lamports lived directly on the record.
+            // Wrap them into a single "W1" slot.
+            let pubkey = v.get("pubkey")?.as_str()?.to_string();
+            let secret: EnvelopeSecret = serde_json::from_value(v.get("secret")?.clone()).ok()?;
+            let positions: Vec<Position> = v
+                .get("positions")
+                .and_then(|x| serde_json::from_value(x.clone()).ok())
+                .unwrap_or_default();
+            let yield_principal_lamports = v.get("yield_principal_lamports").and_then(|x| x.as_u64()).unwrap_or(0);
+            vec![WalletSlot {
+                label: "W1".to_string(),
+                pubkey,
+                secret,
+                positions,
+                yield_principal_lamports,
+            }]
+        };
+        if wallets.is_empty() {
+            // Should be unreachable (both branches above always produce
+            // >=1 slot), but never persist a user with zero wallets --
+            // active()/active_mut() assume at least one exists.
+            return None;
+        }
+        let active_wallet = v
+            .get("active_wallet")
+            .and_then(|x| x.as_u64())
+            .map(|i| i as usize)
+            .unwrap_or(0)
+            .min(wallets.len() - 1);
 
         let pin_lockout: PinLockout = v
             .get("pin_lockout")
             .and_then(|x| serde_json::from_value(x.clone()).ok())
             .unwrap_or_default();
         let slippage_bps = v.get("slippage_bps").and_then(|x| x.as_u64()).unwrap_or(500) as u32;
-        let positions: Vec<Position> = v
-            .get("positions")
-            .and_then(|x| serde_json::from_value(x.clone()).ok())
-            .unwrap_or_default();
         let ref_code = v
             .get("ref_code")
             .and_then(|x| x.as_str())
@@ -143,29 +187,46 @@ impl Db {
             .and_then(|x| serde_json::from_value(x.clone()).ok())
             .unwrap_or_default();
         let subscription_expires_at = v.get("subscription_expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
-        let yield_principal_lamports = v.get("yield_principal_lamports").and_then(|x| x.as_u64()).unwrap_or(0);
+        let yield_auto_enabled = v.get("yield_auto_enabled").and_then(|x| x.as_bool()).unwrap_or(false);
 
         Some(UserRecord {
             telegram_id,
-            pubkey,
-            secret,
+            wallets,
+            active_wallet,
             pin_lockout,
             awaiting: Awaiting::None, // transient UI state only -- always safe to reset
             slippage_bps,
-            positions,
             ref_code,
             refs,
             created_at,
             gem_alerts,
             known_withdraw_addresses,
             subscription_expires_at,
-            yield_principal_lamports,
+            yield_auto_enabled,
         })
     }
 
     pub fn save_user(&self, user: &UserRecord) -> Result<()> {
         let bytes = serde_json::to_vec(user)?;
         self.inner.insert(Self::key(user.telegram_id), bytes)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+
+    /// Permanently removes a user's record -- used by the self-service
+    /// "Reset Account" flow (see handlers.rs) when someone has lost their
+    /// PIN and has no way back into their existing wallet. This does NOT
+    /// touch the old wallet on-chain in any way -- its address and any
+    /// funds in it are untouched and still exist, they're just no longer
+    /// associated with this Telegram account inside Wraith. If the user
+    /// separately saved that wallet's private key, they can still import
+    /// it into any external wallet app directly; if they never backed it
+    /// up, this action is exactly as unrecoverable as forgetting the PIN
+    /// already was -- reset doesn't create a new problem, it just accepts
+    /// the one that already existed and lets them move forward with a
+    /// fresh wallet.
+    pub fn delete_user(&self, telegram_id: i64) -> Result<()> {
+        self.inner.remove(Self::key(telegram_id))?;
         self.inner.flush()?;
         Ok(())
     }

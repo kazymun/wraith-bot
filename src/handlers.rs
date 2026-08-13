@@ -8,7 +8,7 @@ use crate::rpc::SolanaRpc;
 use crate::state::{Awaiting, Position, UserRecord};
 use crate::telegram::{TgClient, TgMessage};
 use crate::wallet;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::system_instruction;
@@ -82,6 +82,9 @@ pub struct App {
     /// Cut of staking GAINS ONLY (never principal) taken on unstake, in
     /// basis points. See config.rs (YIELD_FEE_BPS) and execute_unstake.
     pub yield_fee_bps: u32,
+    /// Liquid SOL always left un-staked in an auto-yield user's active
+    /// wallet. See config.rs (YIELD_RESERVE_SOL).
+    pub yield_reserve_lamports: u64,
     sessions: Arc<Mutex<HashMap<i64, TradingSession>>>,
 }
 
@@ -99,6 +102,7 @@ impl App {
         subscription_lamports: u64,
         max_priority_fee_lamports: u64,
         yield_fee_bps: u32,
+        yield_reserve_lamports: u64,
     ) -> Self {
         Self {
             tg,
@@ -113,6 +117,7 @@ impl App {
             subscription_lamports,
             max_priority_fee_lamports,
             yield_fee_bps,
+            yield_reserve_lamports,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -179,7 +184,7 @@ impl App {
         if user.pin_lockout.seconds_remaining(now) > 0 {
             return Ok(None);
         }
-        match wallet::load_keypair(&self.crypto, pin, user) {
+        match wallet::load_keypair(&self.crypto, pin, &user.active().secret) {
             Ok(kp) => {
                 user.pin_lockout.record_success();
                 self.db.save_user(user)?;
@@ -225,7 +230,7 @@ impl App {
     async fn main_menu_text(&self, chat_id: i64, user: &UserRecord) -> String {
         let balance_sol = self
             .rpc
-            .get_balance_lamports(&user.pubkey)
+            .get_balance_lamports(&user.active().pubkey)
             .await
             .map(|l| l as f64 / LAMPORTS_PER_SOL)
             .unwrap_or(-1.0);
@@ -242,7 +247,7 @@ impl App {
             💰 <b>Balance:</b> {balance_line}\n\
             👛 <b>Wallet:</b> <code>{}</code>\n\n\
             Select an option:",
-            short_wallet(&user.pubkey)
+            short_wallet(&user.active().pubkey)
         )
     }
 
@@ -261,13 +266,13 @@ impl App {
     /// user's subscription has lapsed or never started. Deliberately still
     /// shows their wallet address/balance so they can deposit funds to pay.
     async fn send_subscribe_prompt(&self, chat_id: i64, user: &UserRecord) -> Result<()> {
-        let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
         let price = self.subscription_sol_str();
         self.tg.send_html(
             chat_id,
             &format!(
                 "🔒 <b>Wraith is subscription-only</b>\n\n💳 <b>{price} / month</b> unlocks full access — buying, selling, AI tools, alerts, everything.\n\n👛 <b>Your wallet:</b>\n<code>{}</code>\n💰 <b>Balance:</b> {balance_sol:.4} SOL\n\nDeposit at least {price} (plus a little extra for network fees), then tap Subscribe below.",
-                user.pubkey
+                user.active().pubkey
             ),
             Some(kb::subscribe_menu(&price)),
         ).await?;
@@ -345,6 +350,19 @@ impl App {
 
         let mut user = self.get_or_create_user(telegram_id)?;
 
+        // Security: if the user's next message was going to be a PIN or a
+        // raw private key, get rid of it from Telegram's chat history right
+        // now -- before we even look at whether it was correct. This is
+        // deliberately unconditional (fires on wrong PINs too, and even if
+        // something below errors out) so nothing sensitive is ever left
+        // sitting in the conversation for someone with a stolen/unlocked
+        // phone to scroll back and find. Best-effort: Telegram occasionally
+        // rejects a delete (message already gone, edited, etc) -- that's
+        // not worth failing the whole request over.
+        if user.awaiting.expects_sensitive_input() {
+            let _ = self.tg.delete_message(chat_id, msg.message_id).await;
+        }
+
         match user.awaiting.clone() {
             Awaiting::SettingPin { pending_wallet_secret_plain_b58 } => {
                 if text.len() < self.min_pin_length || !text.chars().all(|c| c.is_ascii_digit()) {
@@ -360,7 +378,7 @@ impl App {
                 let mut plaintext = pending_wallet_secret_plain_b58;
                 let secret = self.crypto.encrypt_with_pin(&text, plaintext.as_bytes())?;
                 plaintext.zeroize();
-                user.secret = secret;
+                user.active_mut().secret = secret;
                 user.awaiting = Awaiting::None;
                 self.db.save_user(&user)?;
                 self.tg
@@ -472,20 +490,38 @@ impl App {
                     return Ok(());
                 }
                 let now = crate::state::chrono_now();
-                match self.crypto.rewrap_with_new_pin(&text, &new_pin, &user.secret) {
-                    Ok(fresh) => {
-                        user.secret = fresh;
-                        user.pin_lockout.record_success();
-                        user.awaiting = Awaiting::None;
-                        self.db.save_user(&user)?;
-                        self.clear_session(telegram_id);
-                        self.tg.send_html(chat_id, "✅ <b>PIN changed!</b>", Some(kb::main_only())).await?;
+                // One PIN protects every wallet slot, so changing it has
+                // to re-wrap ALL of them -- rewrapping only the active
+                // slot would silently leave every other wallet locked
+                // under the OLD PIN, permanently unreachable the moment
+                // this save completes. Rewrap into a scratch Vec first so
+                // a mid-way failure (shouldn't happen -- same PIN, same
+                // crypto call, per slot -- but be defensive) never leaves
+                // some slots on the new PIN and others on the old one.
+                let mut rewrapped = Vec::with_capacity(user.wallets.len());
+                let mut failed = false;
+                for slot in &user.wallets {
+                    match self.crypto.rewrap_with_new_pin(&text, &new_pin, &slot.secret) {
+                        Ok(fresh) => rewrapped.push(fresh),
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
                     }
-                    Err(_) => {
-                        user.pin_lockout.record_failure(now);
-                        self.db.save_user(&user)?;
-                        self.tg.send_html(chat_id, "❌ Wrong current PIN. Try again, or /cancel.", None).await?;
+                }
+                if failed || rewrapped.len() != user.wallets.len() {
+                    user.pin_lockout.record_failure(now);
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "❌ Wrong current PIN. Try again, or /cancel.", None).await?;
+                } else {
+                    for (slot, fresh) in user.wallets.iter_mut().zip(rewrapped.into_iter()) {
+                        slot.secret = fresh;
                     }
+                    user.pin_lockout.record_success();
+                    user.awaiting = Awaiting::None;
+                    self.db.save_user(&user)?;
+                    self.clear_session(telegram_id);
+                    self.tg.send_html(chat_id, "✅ <b>PIN changed!</b> All of your wallets are protected by the new PIN.", Some(kb::main_only())).await?;
                 }
             }
 
@@ -512,25 +548,77 @@ impl App {
                     return Ok(());
                 }
                 let now = crate::state::chrono_now();
-                match wallet::load_keypair(&self.crypto, &text, &user) {
+                // Any existing slot's secret works to verify the PIN --
+                // every wallet under this account shares the same PIN.
+                match wallet::load_keypair(&self.crypto, &text, &user.active().secret) {
                     Ok(_) => {
                         user.pin_lockout.record_success();
+                        if user.wallets.len() >= crate::state::MAX_WALLETS {
+                            self.db.save_user(&user)?;
+                            self.tg.send_html(chat_id, &format!("❌ You're at the {}-wallet limit — remove one before importing another.", crate::state::MAX_WALLETS), Some(kb::main_only())).await?;
+                            return Ok(());
+                        }
                         match wallet::import_encrypted_wallet(&self.crypto, &text, &pending_key_b58) {
                             Ok((pubkey, secret)) => {
-                                user.pubkey = pubkey.clone();
-                                user.secret = secret;
-                                user.positions.clear();
+                                if user.wallets.iter().any(|w| w.pubkey == pubkey) {
+                                    self.db.save_user(&user)?;
+                                    self.tg.send_html(chat_id, "❌ That wallet is already imported under one of your existing slots.", Some(kb::main_only())).await?;
+                                    return Ok(());
+                                }
+                                let label = user.next_wallet_label();
+                                user.wallets.push(crate::state::WalletSlot::new(label.clone(), pubkey.clone(), secret));
+                                user.active_wallet = user.wallets.len() - 1;
                                 user.awaiting = Awaiting::None;
                                 self.db.save_user(&user)?;
                                 self.clear_session(telegram_id);
                                 self.tg.send_html(chat_id,
-                                    &format!("✅ <b>Wallet Imported!</b>\n\n📍 <b>Address:</b> <code>{pubkey}</code>"),
-                                    Some(kb::wallet_menu()),
+                                    &format!("✅ <b>Wallet Imported as {label}!</b>\n\n📍 <b>Address:</b> <code>{pubkey}</code>\n\nThis is now your active wallet — switch back anytime from Wallet → 🔀 Switch Wallet."),
+                                    Some(kb::wallet_menu(&user)),
                                 ).await?;
                             }
                             Err(e) => {
                                 self.db.save_user(&user)?;
                                 self.tg.send_html(chat_id, &format!("❌ {e}"), Some(kb::main_only())).await?;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        user.pin_lockout.record_failure(now);
+                        self.db.save_user(&user)?;
+                        self.tg.send_html(chat_id, "❌ Wrong PIN. Try again, or /cancel.", None).await?;
+                    }
+                }
+            }
+
+            Awaiting::VerifyingPinForAddWallet { pending_pubkey, pending_wallet_secret_plain_b58 } => {
+                if let Some(m) = lockout_message(&user) {
+                    self.tg.send_html(chat_id, &m, None).await?;
+                    return Ok(());
+                }
+                let now = crate::state::chrono_now();
+                // Verify against any existing slot -- same shared PIN.
+                match wallet::load_keypair(&self.crypto, &text, &user.active().secret) {
+                    Ok(_) => {
+                        user.pin_lockout.record_success();
+                        let mut plaintext = pending_wallet_secret_plain_b58;
+                        let encrypt_result = self.crypto.encrypt_with_pin(&text, plaintext.as_bytes());
+                        plaintext.zeroize();
+                        match encrypt_result {
+                            Ok(secret) => {
+                                let label = user.next_wallet_label();
+                                user.wallets.push(crate::state::WalletSlot::new(label.clone(), pending_pubkey.clone(), secret));
+                                user.active_wallet = user.wallets.len() - 1;
+                                user.awaiting = Awaiting::None;
+                                self.db.save_user(&user)?;
+                                self.clear_session(telegram_id);
+                                self.tg.send_html(chat_id,
+                                    &format!("✅ <b>New wallet {label} created!</b>\n\n📍 <b>Address:</b> <code>{pending_pubkey}</code>\n\nThis is now your active wallet — switch back anytime from Wallet → 🔀 Switch Wallet."),
+                                    Some(kb::wallet_menu(&user)),
+                                ).await?;
+                            }
+                            Err(e) => {
+                                self.db.save_user(&user)?;
+                                self.tg.send_html(chat_id, &format!("❌ Couldn't create wallet: {e}"), Some(kb::main_only())).await?;
                             }
                         }
                     }
@@ -550,7 +638,7 @@ impl App {
                     self.tg.send_html(chat_id, "❌ That doesn't look like a valid Solana address. Try again from the Wallet menu.", Some(kb::main_only())).await?;
                     return Ok(());
                 }
-                let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+                let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 if balance_sol <= 0.0005 {
                     self.db.save_user(&user)?;
                     self.tg.send_html(chat_id, "❌ Insufficient balance to withdraw.", Some(kb::main_only())).await?;
@@ -700,6 +788,35 @@ impl App {
                 }
             }
 
+            Awaiting::ConfirmingReset => {
+                if text.eq_ignore_ascii_case("RESET") {
+                    self.db.delete_user(telegram_id)?;
+                    // Recreate exactly as a first-time /start would: fresh
+                    // wallet generated, awaiting a new PIN.
+                    let new_user = self.get_or_create_user(telegram_id)?;
+                    let Awaiting::SettingPin { .. } = new_user.awaiting else {
+                        // get_or_create_user always sets this for a record
+                        // that didn't previously exist -- if it somehow
+                        // didn't, fail loudly rather than leave the user
+                        // stuck with no wallet and no prompt.
+                        return Err(anyhow!("reset: expected fresh SettingPin state, got something else"));
+                    };
+                    self.tg.send_html(
+                        chat_id,
+                        &format!(
+                            "✅ <b>Account reset.</b>\n\nA new Solana wallet has been created for you:\n<code>{}</code>\n\n\
+                             Choose a PIN (at least {} digits) to protect it:",
+                            new_user.active().pubkey, self.min_pin_length
+                        ),
+                        None,
+                    ).await?;
+                } else {
+                    user.awaiting = Awaiting::None;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id, "Cancelled — your existing wallet is unchanged.", Some(kb::main_only())).await?;
+                }
+            }
+
             Awaiting::None => {}
         }
 
@@ -725,7 +842,7 @@ impl App {
                     self.tg.send_html(chat_id,
                         &format!(
                             "👻 <b>Welcome to Wraith</b>\n\nA real Solana wallet has been created for you:\n<code>{}</code>\n\n⚠️ <b>Important — read this once:</b>\nThis is a <b>custodial</b> wallet. Your private key is encrypted at rest using your PIN combined with a server-side secret — nobody, including the bot operator, can decrypt it without your PIN.\n\nYou can export your private key anytime via Wallet → Export Private Key and move to your own wallet.\n\nNow choose a PIN (at least {} digits) to protect your wallet:",
-                            user.pubkey, self.min_pin_length
+                            user.active().pubkey, self.min_pin_length
                         ),
                         None,
                     ).await?;
@@ -760,8 +877,8 @@ impl App {
             }
             "/balance" => {
                 let user = self.get_or_create_user(telegram_id)?;
-                let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
-                self.tg.send_html(chat_id, &format!("💰 <b>Balance:</b> {balance_sol:.4} SOL\n👛 <code>{}</code>", user.pubkey), None).await?;
+                let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+                self.tg.send_html(chat_id, &format!("💰 <b>Balance:</b> {balance_sol:.4} SOL\n👛 <code>{}</code>", user.active().pubkey), None).await?;
             }
             "/pnl" => {
                 self.handle_pnl(chat_id, telegram_id).await?;
@@ -810,11 +927,58 @@ impl App {
                 }
             }
             "wallet" => {
-                let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+                let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+                let label = user.active().label.clone();
                 self.tg.send_html(chat_id,
-                    &format!("💰 <b>Wallet</b>\n\n📍 <b>Address:</b>\n<code>{}</code>\n\n💎 <b>Balance:</b> {balance_sol:.4} SOL\n\nSend SOL to this address to deposit.", user.pubkey),
-                    Some(kb::wallet_menu()),
+                    &format!("💰 <b>Wallet {label}</b>\n\n📍 <b>Address:</b>\n<code>{}</code>\n\n💎 <b>Balance:</b> {balance_sol:.4} SOL\n\nSend SOL to this address to deposit.", user.active().pubkey),
+                    Some(kb::wallet_menu(&user)),
                 ).await?;
+            }
+            "wallet_switch" => {
+                self.tg.send_html(chat_id,
+                    &format!("🔀 <b>Your Wallets</b> ({}/{})\n\nTap one to make it active, or add another below.", user.wallets.len(), crate::state::MAX_WALLETS),
+                    Some(kb::wallet_switcher(&user)),
+                ).await?;
+            }
+            other if other.starts_with("walletsel_") => {
+                if let Ok(i) = other.trim_start_matches("walletsel_").parse::<usize>() {
+                    if i < user.wallets.len() {
+                        user.active_wallet = i;
+                        self.db.save_user(&user)?;
+                        // The cached trading-session keypair (if any) is
+                        // for the PREVIOUS active wallet -- keep using it
+                        // after a switch would sign with the wrong
+                        // wallet's key. Drop it; next trade re-prompts
+                        // for the PIN, same as after any other wallet
+                        // change.
+                        self.clear_session(telegram_id);
+                        let label = user.active().label.clone();
+                        self.tg.send_html(chat_id, &format!("✅ Switched to <b>{label}</b>."), Some(kb::wallet_menu(&user))).await?;
+                    }
+                }
+            }
+            "wallet_add" => {
+                if user.wallets.len() >= crate::state::MAX_WALLETS {
+                    self.tg.send_html(chat_id, &format!("❌ You're at the {}-wallet limit.", crate::state::MAX_WALLETS), Some(kb::wallet_menu(&user))).await?;
+                } else {
+                    self.tg.send_html(chat_id, "➕ <b>Add Wallet</b>\n\nGenerate a brand new Wraith wallet, or import one you already have:", Some(kb::add_wallet_menu())).await?;
+                }
+            }
+            "wallet_add_new" => {
+                if user.wallets.len() >= crate::state::MAX_WALLETS {
+                    self.tg.send_html(chat_id, &format!("❌ You're at the {}-wallet limit.", crate::state::MAX_WALLETS), Some(kb::wallet_menu(&user))).await?;
+                } else {
+                    let wallet = wallet::create_wallet();
+                    user.awaiting = Awaiting::VerifyingPinForAddWallet {
+                        pending_pubkey: wallet.address.clone(),
+                        pending_wallet_secret_plain_b58: wallet.private_key_base58.clone(),
+                    };
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id,
+                        &format!("🆕 New wallet address:\n<code>{}</code>\n\n🔑 Enter your PIN to confirm and encrypt it (same PIN as your other wallets):", wallet.address),
+                        Some(kb::cancel_to("wallet")),
+                    ).await?;
+                }
             }
             "buy" => {
                 user.awaiting = Awaiting::EnteringBuyCA;
@@ -828,7 +992,7 @@ impl App {
                 self.handle_positions(chat_id, telegram_id).await?;
             }
             "withdraw" => {
-                let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+                let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 if balance_sol <= 0.0005 {
                     self.tg.send_html(chat_id, "❌ Insufficient balance to withdraw.", Some(kb::main_only())).await?;
                 } else {
@@ -843,12 +1007,16 @@ impl App {
                 self.tg.send_html(chat_id, "🔑 Enter your PIN to export your private key:", None).await?;
             }
             "import_wallet" => {
-                user.awaiting = Awaiting::EnteringImportKey;
-                self.db.save_user(&user)?;
-                self.tg.send_html(chat_id,
-                    "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. Your current Wraith-generated wallet (and any funds in it) will no longer be accessible through this bot unless you save its key first.\n\nSend your Solana private key (base58):",
-                    Some(kb::cancel_to("wallet")),
-                ).await?;
+                if user.wallets.len() >= crate::state::MAX_WALLETS {
+                    self.tg.send_html(chat_id, &format!("❌ You're at the {}-wallet limit — remove one before importing another.", crate::state::MAX_WALLETS), Some(kb::wallet_menu(&user))).await?;
+                } else {
+                    user.awaiting = Awaiting::EnteringImportKey;
+                    self.db.save_user(&user)?;
+                    self.tg.send_html(chat_id,
+                        "📥 <b>Import Wallet</b>\n\n⚠️ Only do this on a trusted device. This ADDS the imported wallet as a new sub-account (your existing wallets are untouched) and makes it active.\n\nSend your Solana private key (base58):",
+                        Some(kb::cancel_to("wallet")),
+                    ).await?;
+                }
             }
             "ai_tools" => {
                 self.tg.send_html(chat_id, "🤖 <b>AI Tools</b>", Some(kb::ai_tools_menu())).await?;
@@ -868,18 +1036,50 @@ impl App {
                 self.handle_gem_scan(chat_id).await?;
             }
             "settings" => {
-                self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu(user.gem_alerts))).await?;
+                self.tg.send_html(chat_id, "⚙️ <b>Settings</b>", Some(kb::settings_menu(user.gem_alerts, user.yield_auto_enabled))).await?;
             }
             "toggle_gem_alerts" => {
                 user.gem_alerts = !user.gem_alerts;
                 self.db.save_user(&user)?;
                 let status = if user.gem_alerts { "🔔 Gem alerts <b>enabled</b> — you'll be notified when new gems are found." } else { "🔕 Gem alerts <b>disabled</b> — you won't receive gem notifications." };
-                self.tg.send_html(chat_id, status, Some(kb::settings_menu(user.gem_alerts))).await?;
+                self.tg.send_html(chat_id, status, Some(kb::settings_menu(user.gem_alerts, user.yield_auto_enabled))).await?;
+            }
+            "toggle_auto_yield" => {
+                user.yield_auto_enabled = !user.yield_auto_enabled;
+                self.db.save_user(&user)?;
+                let status = if user.yield_auto_enabled {
+                    "🌾 <b>Auto-Yield enabled</b> — from now on, idle SOL in your active wallet gets staked into JitoSOL automatically (whenever the bot already has your trading session unlocked), and auto-unstaked the instant you need it for a buy. Wraith still only ever takes 10% of the gain, never your principal.\n\n<i>Note: this only runs while your 15-min trading session is unlocked -- Wraith never stores your PIN, so it can't act while you're fully logged out.</i>"
+                } else {
+                    "🌾 <b>Auto-Yield disabled</b> — your SOL will stay exactly where it is. Anything already staked stays staked until you manually unstake it from 🌱 Yield."
+                };
+                self.tg.send_html(chat_id, status, Some(kb::settings_menu(user.gem_alerts, user.yield_auto_enabled))).await?;
+                // If we already have a live session (they just unlocked
+                // trading recently), sweep right away instead of making
+                // them wait for the next periodic pass or their next buy.
+                if user.yield_auto_enabled {
+                    if let Some(kp) = self.session_keypair(telegram_id) {
+                        self.maybe_auto_sweep_idle(chat_id, &mut user, &kp).await;
+                    }
+                }
             }
             "change_pin" => {
                 user.awaiting = Awaiting::EnteringNewPin;
                 self.db.save_user(&user)?;
                 self.tg.send_html(chat_id, &format!("🔑 Enter your <b>new</b> PIN (at least {} digits):", self.min_pin_length), None).await?;
+            }
+            "reset_account" => {
+                user.awaiting = Awaiting::ConfirmingReset;
+                self.db.save_user(&user)?;
+                self.tg.send_html(
+                    chat_id,
+                    "⚠️ <b>Reset Account</b>\n\n\
+                     This is for when you've lost your PIN and can't get back into your current wallet.\n\n\
+                     Resetting will generate a <b>brand new wallet</b> for you here in Wraith. Your current wallet address still exists on-chain and is untouched — but Wraith will no longer have any way to access it, since that requires the PIN you no longer have.\n\n\
+                     • If you previously exported/saved that wallet's private key, you can still import it into any external wallet (Phantom, Backpack, etc.) at any time — nothing is lost.\n\
+                     • If you never saved it, any funds in that wallet are permanently inaccessible. This is not something Wraith or its operator can undo or override — nobody but you ever held the PIN.\n\n\
+                     Type <b>RESET</b> to confirm, or anything else to cancel.",
+                    Some(kb::cancel_to("main")),
+                ).await?;
             }
             "slippage" => {
                 self.tg.send_html(chat_id, &format!("📊 Current slippage: {:.1}%\n\nSelect:", user.slippage_bps as f64 / 100.0), Some(kb::slippage_menu())).await?;
@@ -934,7 +1134,7 @@ impl App {
             }
             other if other.starts_with("sellsel_") => {
                 let ca = other.trim_start_matches("sellsel_");
-                let label = user.positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(ca));
+                let label = user.active().positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(ca));
                 self.tg.send_html(chat_id, &format!("🔴 <b>Sell {label}</b>\n\nHow much do you want to sell?"), Some(kb::sell_percent_menu(ca))).await?;
             }
             other if other.starts_with("sellpct_") => {
@@ -1015,7 +1215,7 @@ impl App {
         if Self::looks_like_ca(input) {
             return Ok(Some(input.to_string()));
         }
-        if let Some(p) = user.positions.iter().find(|p| p.symbol.eq_ignore_ascii_case(input)) {
+        if let Some(p) = user.active().positions.iter().find(|p| p.symbol.eq_ignore_ascii_case(input)) {
             return Ok(Some(p.mint.clone()));
         }
         self.resolve_token_query(chat_id, input).await
@@ -1026,14 +1226,14 @@ impl App {
     /// otherwise falls back to asking for a CA/name to type.
     async fn start_sell_flow(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let mut user = self.get_or_create_user(telegram_id)?;
-        if user.positions.is_empty() {
+        if user.active().positions.is_empty() {
             user.awaiting = Awaiting::EnteringSellCA;
             self.db.save_user(&user)?;
             self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nYou don't have any tracked positions, but you can still sell any token in your wallet. Paste the CA, or type the coin's name/symbol:", Some(kb::cancel_to("main"))).await?;
         } else {
             user.awaiting = Awaiting::EnteringSellCA;
             self.db.save_user(&user)?;
-            self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nPick a position below, or type a CA/coin name:", Some(kb::position_list(&user.positions))).await?;
+            self.tg.send_html(chat_id, "🔴 <b>Sell Token</b>\n\nPick a position below, or type a CA/coin name:", Some(kb::position_list(&user.active().positions))).await?;
         }
         Ok(())
     }
@@ -1043,7 +1243,7 @@ impl App {
     /// selling immediately.
     async fn handle_sell_query(&self, chat_id: i64, user: &UserRecord, input: &str) -> Result<()> {
         let Some(ca) = self.resolve_sell_query(chat_id, user, input).await? else { return Ok(()); };
-        let label = user.positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(&ca));
+        let label = user.active().positions.iter().find(|p| p.mint == ca).map(|p| p.symbol.clone()).unwrap_or_else(|| short_wallet(&ca));
         self.tg.send_html(chat_id, &format!("🔴 <b>Sell {label}</b>\n\nHow much do you want to sell?"), Some(kb::sell_percent_menu(&ca))).await?;
         Ok(())
     }
@@ -1070,7 +1270,7 @@ impl App {
     /// command.
     async fn handle_positions(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let user = self.get_or_create_user(telegram_id)?;
-        if user.positions.is_empty() {
+        if user.active().positions.is_empty() {
             self.tg.send_html(chat_id, "📊 <b>Open Positions</b>\n\nNo open positions yet.", Some(kb::main_only())).await?;
             return Ok(());
         }
@@ -1086,7 +1286,7 @@ impl App {
         });
 
         let mut set = tokio::task::JoinSet::new();
-        for (i, p) in user.positions.iter().enumerate() {
+        for (i, p) in user.active().positions.iter().enumerate() {
             let mint = p.mint.clone();
             set.spawn(async move {
                 let price = dexscreener::get_token_pair(&mint)
@@ -1097,7 +1297,7 @@ impl App {
                 (i, price)
             });
         }
-        let mut prices: Vec<Option<f64>> = vec![None; user.positions.len()];
+        let mut prices: Vec<Option<f64>> = vec![None; user.active().positions.len()];
         while let Some(res) = set.join_next().await {
             if let Ok((i, price)) = res {
                 prices[i] = price;
@@ -1106,7 +1306,7 @@ impl App {
         let sol_price_usd = sol_handle.await.unwrap_or(0.0);
 
         let mut msg = "📊 <b>Open Positions</b>\n\n".to_string();
-        for (i, p) in user.positions.iter().enumerate() {
+        for (i, p) in user.active().positions.iter().enumerate() {
             let current_price_usd = prices[i];
 
             match current_price_usd {
@@ -1204,8 +1404,13 @@ impl App {
         let amount_sol: f64 = amt_str.parse().unwrap_or(0.0);
         let mut user = self.get_or_create_user(telegram_id)?;
 
-        let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
-        if balance_sol < amount_sol {
+        let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        // If Auto-Yield is on, don't reject here on liquid balance alone
+        // -- execute_buy checks again and auto-unstakes to cover the gap
+        // if the user has staked JitoSOL that can. If they don't have
+        // enough even after that, the swap itself will fail cleanly with
+        // its own clear error rather than this needing to predict it.
+        if balance_sol < amount_sol && !user.yield_auto_enabled {
             self.tg.send_html(chat_id, &format!("❌ Insufficient balance. You have {balance_sol:.4} SOL, need {amount_sol} SOL."), Some(kb::main_only())).await?;
             return Ok(());
         }
@@ -1230,8 +1435,8 @@ impl App {
     /// balance -- an estimate, same as any other quote-based price shown
     /// elsewhere in the bot, not a guaranteed execution price.
     async fn show_yield_menu(&self, chat_id: i64, user: &UserRecord) -> Result<()> {
-        let (jito_raw, _decimals) = self.rpc.get_token_balance(&user.pubkey, JITO_SOL_MINT).await.unwrap_or((0, 9));
-        let principal_sol = user.yield_principal_lamports as f64 / LAMPORTS_PER_SOL;
+        let (jito_raw, _decimals) = self.rpc.get_token_balance(&user.active().pubkey, JITO_SOL_MINT).await.unwrap_or((0, 9));
+        let principal_sol = user.active().yield_principal_lamports as f64 / LAMPORTS_PER_SOL;
 
         if jito_raw == 0 {
             self.tg.send_html(
@@ -1271,7 +1476,7 @@ impl App {
         // Leave a small buffer beyond the stake amount for network/priority
         // fees on the swap itself, same margin do_withdraw already uses
         // for the same reason.
-        let balance_sol = self.rpc.get_balance_lamports(&user.pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
+        let balance_sol = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
         if balance_sol < amount_sol + 0.01 {
             self.tg.send_html(chat_id, &format!("❌ Insufficient balance. You have {balance_sol:.4} SOL, need at least {:.4} SOL ({amount_sol} SOL to stake + network fees).", amount_sol + 0.01), Some(kb::main_only())).await?;
             return Ok(());
@@ -1307,9 +1512,10 @@ impl App {
             }
         };
 
-        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, "").await {
+        match self.sign_and_send_swap(keypair, &user.active().pubkey, &quote, "").await {
             Ok(sig) => {
-                user.yield_principal_lamports = user.yield_principal_lamports.saturating_add(lamports);
+                let new_principal = user.active().yield_principal_lamports.saturating_add(lamports);
+                user.active_mut().yield_principal_lamports = new_principal;
                 self.db.save_user(user)?;
                 self.tg.send_html(chat_id, &format!(
                     "✅ <b>Staked</b>\n\n💸 {amount_sol} SOL -> JitoSOL\n🔗 Tx: <code>{sig}</code>\n\nYour rewards accrue automatically -- check 🌱 Yield anytime to see current value."
@@ -1330,7 +1536,7 @@ impl App {
     /// (e.g. an extreme slashing scenario, or a quote that moved against
     /// the user), no fee is taken at all.
     async fn execute_unstake(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair) -> Result<()> {
-        let (jito_raw, _decimals) = match self.rpc.get_token_balance(&user.pubkey, JITO_SOL_MINT).await {
+        let (jito_raw, _decimals) = match self.rpc.get_token_balance(&user.active().pubkey, JITO_SOL_MINT).await {
             Ok(v) => v,
             Err(e) => {
                 self.tg.send_html(chat_id, &format!("❌ Couldn't check your JitoSOL balance: {e}"), Some(kb::main_only())).await?;
@@ -1353,7 +1559,7 @@ impl App {
         };
         let out_lamports = out_amount(&quote).unwrap_or(0);
 
-        let sig = match self.sign_and_send_swap(keypair, &user.pubkey, &quote, "").await {
+        let sig = match self.sign_and_send_swap(keypair, &user.active().pubkey, &quote, "").await {
             Ok(sig) => sig,
             Err(e) => {
                 self.tg.send_html(chat_id, &format!("❌ Unstake failed: {e}"), Some(kb::main_only())).await?;
@@ -1361,7 +1567,7 @@ impl App {
             }
         };
 
-        let principal_lamports = user.yield_principal_lamports;
+        let principal_lamports = user.active().yield_principal_lamports;
         let gain_lamports = out_lamports.saturating_sub(principal_lamports);
         let mut fee_note = String::new();
 
@@ -1396,7 +1602,7 @@ impl App {
             }
         }
 
-        user.yield_principal_lamports = 0;
+        user.active_mut().yield_principal_lamports = 0;
         self.db.save_user(user)?;
 
         let out_sol = out_lamports as f64 / LAMPORTS_PER_SOL;
@@ -1408,7 +1614,90 @@ impl App {
         Ok(())
     }
 
+    /// Auto-Yield's "stake idle SOL" half. Only ever called at a moment
+    /// we already have a live decrypted `keypair` in hand (right after a
+    /// sell, right when the toggle is flipped on with a session already
+    /// unlocked, or from the periodic sweep below for users who happen to
+    /// have a session open at that moment) -- this never prompts for a
+    /// PIN itself. If liquid balance in the active wallet is above
+    /// `yield_reserve_lamports`, stakes the excess. Silently does nothing
+    /// if the excess is dust-sized (not worth a swap's own network fee)
+    /// or if `user.yield_auto_enabled` is off.
+    async fn maybe_auto_sweep_idle(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair) {
+        if !user.yield_auto_enabled {
+            return;
+        }
+        const MIN_SWEEP_LAMPORTS: u64 = 20_000_000; // 0.02 SOL -- below this, the swap's own fee isn't worth it
+        let balance_lamports = match self.rpc.get_balance_lamports(&user.active().pubkey).await {
+            Ok(b) => b,
+            Err(_) => return, // best-effort -- a failed balance check here should never surface as an error to the user
+        };
+        if balance_lamports <= self.yield_reserve_lamports {
+            return;
+        }
+        let excess_lamports = balance_lamports - self.yield_reserve_lamports;
+        if excess_lamports < MIN_SWEEP_LAMPORTS {
+            return;
+        }
+        let amount_sol = excess_lamports as f64 / LAMPORTS_PER_SOL;
+        let _ = self.tg.send_html(chat_id, &format!("🌾 Auto-staking {amount_sol:.4} idle SOL into yield..."), None).await;
+        let _ = self.execute_stake(chat_id, user, keypair, amount_sol).await;
+    }
+
+    /// Auto-Yield's periodic pass -- runs on a fixed interval (spawned
+    /// from main.rs), checking every user with `yield_auto_enabled` on.
+    /// IMPORTANT LIMITATION (by design, not a bug): this can only act on
+    /// users who happen to have a live trading session unlocked at the
+    /// moment this runs, since Wraith has no master key and never caches
+    /// a PIN beyond the normal 15-minute session window -- there is no
+    /// way for a background task to decrypt a wallet on its own. For a
+    /// user who isn't actively using the bot, idle SOL gets swept the
+    /// next time THEY unlock trading (buy/sell/stake), not while they're
+    /// fully offline. This is the correct trade-off given the existing
+    /// "no master key, ever" security model -- see crypto.rs.
+    pub async fn run_yield_sweep(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await; // every 5 minutes
+            let mut candidates: Vec<UserRecord> = vec![];
+            for item in self.db.inner_iter() {
+                let Ok((key, bytes)) = item else { continue };
+                if !key.starts_with(b"user:") {
+                    continue;
+                }
+                if let Ok(user) = serde_json::from_slice::<UserRecord>(&bytes) {
+                    if user.yield_auto_enabled {
+                        candidates.push(user);
+                    }
+                }
+            }
+            for mut user in candidates {
+                let telegram_id = user.telegram_id;
+                let Some(kp) = self.session_keypair(telegram_id) else { continue }; // no live session -- skip, see doc comment above
+                self.maybe_auto_sweep_idle(telegram_id, &mut user, &kp).await; // Telegram user id == their own DM chat id
+            }
+        }
+    }
+
     async fn execute_buy(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str, amount_sol: f64) -> Result<()> {
+        // Auto-Yield's "unstake when needed" half: if the user's liquid
+        // SOL can't cover this buy, unstake their full JitoSOL position
+        // first (same gains-only fee as a manual unstake -- see
+        // execute_unstake) so the buy can proceed. Any unstaked amount
+        // beyond what this buy needs stays liquid; it'll get swept back
+        // into yield next time maybe_auto_sweep_idle runs, if still on.
+        if user.yield_auto_enabled {
+            let needed_lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
+            let current_lamports = self.rpc.get_balance_lamports(&user.active().pubkey).await.unwrap_or(0);
+            if current_lamports < needed_lamports {
+                self.tg.send_html(chat_id, "🌾 Unstaking yield to cover this buy...", None).await?;
+                // Best-effort: if this fails (nothing staked, quote
+                // error, etc), fall through and let the ordinary
+                // insufficient-balance/quote-failure handling below
+                // explain it -- no point stacking two error messages.
+                let _ = self.execute_unstake(chat_id, user, keypair).await;
+            }
+        }
+
         self.tg.send_html(chat_id, "⚡ Getting quote...", None).await?;
 
         let lamports = (amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -1432,7 +1721,7 @@ impl App {
 
         self.tg.send_html(chat_id, "⚡ Executing swap...", None).await?;
 
-        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, &self.fee_wallet).await {
+        match self.sign_and_send_swap(keypair, &user.active().pubkey, &quote, &self.fee_wallet).await {
             Ok(sig) => {
                 let est_out_raw = out_amount(&quote).unwrap_or(0);
 
@@ -1457,7 +1746,7 @@ impl App {
                 let usd_line = if spent_usd_est > 0.0 { format!(" (~${spent_usd_est:.2})") } else { String::new() };
                 let entry_line = if entry_price_usd > 0.0 { format!("\n💵 Entry price: ${entry_price_usd:.8}") } else { String::new() };
 
-                user.positions.push(Position {
+                user.active_mut().positions.push(Position {
                     mint: ca.to_string(),
                     symbol: symbol.clone(),
                     sol_spent: amount_sol,
@@ -1479,7 +1768,7 @@ impl App {
     }
 
     async fn execute_sell(&self, chat_id: i64, user: &mut UserRecord, keypair: &Keypair, ca: &str, pct: u8) -> Result<()> {
-        let (raw_balance, decimals) = match self.rpc.get_token_balance(&user.pubkey, ca).await {
+        let (raw_balance, decimals) = match self.rpc.get_token_balance(&user.active().pubkey, ca).await {
             Ok(v) => v,
             Err(e) => {
                 self.tg.send_html(chat_id, &format!("❌ Couldn't check your token balance: {e}"), Some(kb::main_only())).await?;
@@ -1514,14 +1803,14 @@ impl App {
 
         self.log_platform_fee(&quote, "sell");
 
-        match self.sign_and_send_swap(keypair, &user.pubkey, &quote, &self.fee_wallet).await {
+        match self.sign_and_send_swap(keypair, &user.active().pubkey, &quote, &self.fee_wallet).await {
             Ok(sig) => {
                 let est_out_sol = out_amount(&quote).unwrap_or(0) as f64 / LAMPORTS_PER_SOL;
                 let human_amount = sell_raw as f64 / 10f64.powi(decimals as i32);
 
                 if pct >= 100 {
-                    user.positions.retain(|p| p.mint != ca);
-                } else if let Some(p) = user.positions.iter_mut().find(|p| p.mint == ca) {
+                    user.active_mut().positions.retain(|p| p.mint != ca);
+                } else if let Some(p) = user.active_mut().positions.iter_mut().find(|p| p.mint == ca) {
                     // Reduce the tracked cost-basis/holdings by the sold
                     // fraction so PnL on the remainder stays meaningful,
                     // rather than deleting or leaving the position stale.
@@ -1534,6 +1823,10 @@ impl App {
                 self.tg.send_html(chat_id, &format!(
                     "✅ <b>Sell sent</b>\n\n🪙 Sold: ~{human_amount:.4} tokens ({pct}%)\n💰 Est. received: {est_out_sol:.4} SOL\n🔗 Tx: <code>{sig}</code>"
                 ), Some(kb::main_only())).await?;
+
+                // Proceeds just landed as liquid SOL -- a natural moment
+                // to sweep into yield if the user has Auto-Yield on.
+                self.maybe_auto_sweep_idle(chat_id, user, keypair).await;
             }
             Err(e) => {
                 self.tg.send_html(chat_id, &format!("❌ Swap failed: {e}"), Some(kb::main_only())).await?;
@@ -1879,7 +2172,7 @@ impl App {
 
     async fn handle_pnl(&self, chat_id: i64, telegram_id: i64) -> Result<()> {
         let user = self.get_or_create_user(telegram_id)?;
-        if user.positions.is_empty() {
+        if user.active().positions.is_empty() {
             self.tg.send_html(chat_id, "📈 <b>PnL Summary</b>\n\nNo positions tracked yet. Buy a token first!", Some(kb::main_only())).await?;
             return Ok(());
         }
@@ -1892,7 +2185,7 @@ impl App {
             .unwrap_or(0.0);
 
         let mut set = tokio::task::JoinSet::new();
-        for (i, p) in user.positions.iter().enumerate() {
+        for (i, p) in user.active().positions.iter().enumerate() {
             let mint = p.mint.clone();
             set.spawn(async move {
                 let price = dexscreener::get_token_pair(&mint)
@@ -1901,7 +2194,7 @@ impl App {
                 (i, price)
             });
         }
-        let mut prices: Vec<Option<f64>> = vec![None; user.positions.len()];
+        let mut prices: Vec<Option<f64>> = vec![None; user.active().positions.len()];
         while let Some(res) = set.join_next().await {
             if let Ok((i, price)) = res { prices[i] = price; }
         }
@@ -1911,7 +2204,7 @@ impl App {
         let mut total_invested_usd = 0.0f64;
         let mut msg = "📈 <b>PnL Summary</b>\n\n".to_string();
 
-        for (i, p) in user.positions.iter().enumerate() {
+        for (i, p) in user.active().positions.iter().enumerate() {
             total_invested_sol += p.sol_spent;
             match prices[i] {
                 Some(cur) if p.entry_price_usd > 0.0 => {

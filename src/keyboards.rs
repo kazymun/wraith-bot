@@ -1,4 +1,4 @@
-use crate::state::Position;
+use crate::state::{Position, UserRecord, MAX_WALLETS};
 use crate::telegram::{btn, Keyboard};
 
 pub fn main_menu() -> Keyboard {
@@ -69,20 +69,70 @@ pub fn export_key_keyboard() -> Keyboard {
     ]
 }
 
-pub fn wallet_menu() -> Keyboard {
+pub fn wallet_menu(user: &UserRecord) -> Keyboard {
+    let switcher_label = if user.wallets.len() > 1 {
+        format!("🔀 Switch Wallet ({})", user.active().label)
+    } else {
+        "🔀 Add Wallet".to_string()
+    };
     vec![
         vec![btn("🔄 Refresh", "wallet"), btn("⬆️ Withdraw", "withdraw")],
         vec![btn("🔑 Export Private Key", "export_key"), btn("📥 Import Wallet", "import_wallet")],
+        vec![btn(&switcher_label, "wallet_switch")],
         vec![btn("🏠 Main Menu", "main")],
     ]
 }
 
-pub fn settings_menu(gem_alerts: bool) -> Keyboard {
+/// One button per existing wallet slot (tap to make it active), plus an
+/// "add wallet" row unless the user has hit MAX_WALLETS. Callback data is
+/// `walletsel_<index>` for switching, `wallet_add` for adding.
+pub fn wallet_switcher(user: &UserRecord) -> Keyboard {
+    let mut kb: Keyboard = user
+        .wallets
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let mark = if i == user.active_wallet { "✅ " } else { "" };
+            vec![btn(
+                &format!("{mark}{} — {}", w.label, short_display(&w.pubkey)),
+                &format!("walletsel_{i}"),
+            )]
+        })
+        .collect();
+    if user.wallets.len() < MAX_WALLETS {
+        kb.push(vec![btn("➕ Add Wallet", "wallet_add")]);
+    }
+    kb.push(vec![btn("⬅️ Back", "wallet")]);
+    kb
+}
+
+/// Choice of how to add a new wallet slot.
+pub fn add_wallet_menu() -> Keyboard {
+    vec![
+        vec![btn("🆕 Generate New", "wallet_add_new")],
+        vec![btn("📥 Import Existing", "wallet_add_import")],
+        vec![btn("⬅️ Back", "wallet_switch")],
+    ]
+}
+
+/// Local truncated-address helper so this module doesn't need to import
+/// handlers.rs's private `short_wallet` -- same 4+4 truncation.
+pub fn short_display(w: &str) -> String {
+    if w.len() < 8 {
+        return w.to_string();
+    }
+    format!("{}...{}", &w[..4], &w[w.len() - 4..])
+}
+
+pub fn settings_menu(gem_alerts: bool, yield_auto_enabled: bool) -> Keyboard {
     let gem_label = if gem_alerts { "🔔 Gem Alerts: ON" } else { "🔕 Gem Alerts: OFF" };
+    let auto_yield_label = if yield_auto_enabled { "🌾 Auto-Yield: ON" } else { "🌾 Auto-Yield: OFF" };
     vec![
         vec![btn("🔑 Change PIN", "change_pin")],
         vec![btn("📊 Slippage", "slippage")],
         vec![btn(gem_label, "toggle_gem_alerts")],
+        vec![btn(auto_yield_label, "toggle_auto_yield")],
+        vec![btn("🗑️ Reset Account", "reset_account")],
         vec![btn("🏠 Main Menu", "main")],
     ]
 }

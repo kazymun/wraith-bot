@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.subscription_lamports,
         cfg.max_priority_fee_lamports,
         cfg.yield_fee_bps,
+        cfg.yield_reserve_lamports,
     );
 
     // Verify the platform fee wallet's wrapped-SOL token account actually
@@ -71,6 +72,16 @@ async fn main() -> anyhow::Result<()> {
     let scanner_app = app.clone();
     tokio::spawn(async move {
         scanner_app.run_gem_scanner().await;
+    });
+
+    // Spawn Auto-Yield's periodic sweep. See App::run_yield_sweep for the
+    // important caveat: this only acts on users who happen to have a
+    // live trading session unlocked when it runs -- Wraith never caches
+    // a PIN beyond that window, so there's no way for this to touch a
+    // fully-offline user's wallet.
+    let yield_app = app.clone();
+    tokio::spawn(async move {
+        yield_app.run_yield_sweep().await;
     });
 
     // Spawn the PumpPortal WebSocket listener -- the earliest possible

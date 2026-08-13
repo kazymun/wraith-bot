@@ -2,8 +2,7 @@ use anyhow::{anyhow, Result};
 use solana_sdk::signature::{Keypair, Signer};
 use zeroize::Zeroize;
 
-use crate::crypto::Crypto;
-use crate::state::UserRecord;
+use crate::crypto::{Crypto, EnvelopeSecret};
 
 /// A raw Solana wallet, before encryption. Never persist this directly -
 /// it should only exist transiently in memory, and callers should
@@ -55,16 +54,24 @@ pub fn import_encrypted_wallet(
     Ok((wallet.address.clone(), secret))
 }
 
-/// Decrypts and reconstructs the user's Keypair for signing. Call this
-/// only at the moment a signature is actually needed, use it immediately,
-/// and drop it -- never hold the decrypted key or Keypair longer than
+/// Decrypts and reconstructs a Keypair for signing, given the envelope
+/// secret for ONE specific wallet slot (a user may now have several --
+/// pass `&user.active().secret` for "whichever wallet is currently
+/// selected", or any other slot's `.secret` directly). Call this only at
+/// the moment a signature is actually needed, use it immediately, and
+/// drop it -- never hold the decrypted key or Keypair longer than
 /// necessary. Caller MUST have already checked `user.pin_lockout` before
 /// calling this; this function has no rate limiting of its own.
 ///
 /// Returns an error on wrong PIN -- callers must feed that into
-/// `PinLockout::record_failure` and save the user record.
-pub fn load_keypair(crypto: &Crypto, pin: &str, user: &UserRecord) -> Result<Keypair> {
-    let mut plaintext = crypto.decrypt_with_pin(pin, &user.secret)?;
+/// `PinLockout::record_failure` and save the user record. Since every
+/// wallet slot shares the same PIN, a correct PIN decrypts ANY slot --
+/// this can be (and is, in handlers.rs) used against the active wallet
+/// purely to verify "is this the right PIN" even when the operation at
+/// hand concerns a different slot (e.g. confirming identity before
+/// encrypting a newly-added or newly-imported wallet).
+pub fn load_keypair(crypto: &Crypto, pin: &str, secret: &EnvelopeSecret) -> Result<Keypair> {
+    let mut plaintext = crypto.decrypt_with_pin(pin, secret)?;
     let private_key_b58 =
         String::from_utf8(plaintext.clone()).map_err(|e| anyhow!("corrupted key data: {e}"))?;
     plaintext.zeroize();

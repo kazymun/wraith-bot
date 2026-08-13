@@ -53,6 +53,11 @@ pub struct Config {
     /// user unstakes from the built-in JitoSOL yield feature, in basis
     /// points. Set via YIELD_FEE_BPS in .env. Defaults to 1000 (10%).
     pub yield_fee_bps: u32,
+    /// Liquid SOL every auto-yield user always keeps un-staked in their
+    /// active wallet, so there's headroom for network fees / a quick
+    /// small trade without needing to unstake first. Set via
+    /// YIELD_RESERVE_SOL in .env; defaults to 0.05 SOL.
+    pub yield_reserve_lamports: u64,
 }
 
 impl Config {
@@ -107,6 +112,12 @@ impl Config {
             .unwrap_or_else(|_| "1000".to_string())
             .parse()
             .unwrap_or(1000); // default: 10%
+        let yield_reserve_lamports: u64 = std::env::var("YIELD_RESERVE_SOL")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|sol| *sol >= 0.0)
+            .map(|sol| (sol * 1_000_000_000.0).round() as u64)
+            .unwrap_or(50_000_000); // default: 0.05 SOL
 
         // NOTE: WRAITH_MASTER_KEY no longer exists. There is no single
         // key anywhere that decrypts every user's wallet. Each user's
@@ -127,6 +138,7 @@ impl Config {
             subscription_lamports,
             max_priority_fee_lamports,
             yield_fee_bps,
+            yield_reserve_lamports,
         })
     }
 }
