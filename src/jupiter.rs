@@ -70,8 +70,10 @@ pub struct Jupiter {
 impl Jupiter {
     pub fn new(api_key: Option<String>) -> Self {
         Self {
-            // Forced to HTTP/1.1 -- see telegram.rs for why (ALPN/h2
-            // negotiation was surfacing as "invalid HTTP version parsed").
+            // Forced to HTTP/1.1 -- see telegram.rs for the current
+            // reasoning (this setting is network-dependent; re-check that
+            // comment if you ever see "invalid HTTP version parsed" again
+            // on a new deployment target).
             http: reqwest::Client::builder()
                 .http1_only()
                 .build()

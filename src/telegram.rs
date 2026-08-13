@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error as _;
@@ -105,11 +105,17 @@ impl TgClient {
     pub fn new(token: String) -> Self {
         Self {
             token,
-            // Forced to HTTP/1.1: some hosts/CDNs (and the network paths in
-            // front of them) negotiate HTTP/2 via ALPN in a way this
-            // client's stack doesn't cleanly handle, which surfaces as
-            // "invalid HTTP version parsed" on every request. HTTP/1.1
-            // sidesteps that -- there's no h2-specific benefit we need here.
+            // Forced to HTTP/1.1. This has flip-flopped before (see git
+            // history) because the right setting is genuinely
+            // network-dependent: some hosts choke on auto-negotiated
+            // HTTP/2 and need this forced; a couple others apparently hit
+            // "invalid HTTP version parsed" specifically WHEN this was
+            // forced, and were fine without it. If you deploy somewhere
+            // and immediately see "invalid HTTP version parsed" on every
+            // request, that's this setting fighting your network's
+            // proxy/ALPN handling -- try toggling it (verify with a raw
+            // `openssl s_client` request first, same as we did to confirm
+            // this direction was right for the current deployment target).
             http: reqwest::Client::builder()
                 .http1_only()
                 .build()
@@ -179,8 +185,20 @@ impl TgClient {
         Ok(())
     }
 
+    /// IMPORTANT: unlike a generic "fire and forget" API call, callers of
+    /// this specifically rely on knowing whether the delete actually
+    /// happened -- this is how Wraith scrubs PINs and exported private
+    /// keys out of chat history. Telegram's `deleteMessage` can and does
+    /// fail (message older than 48h, already deleted, bot lacks admin
+    /// rights in a group, etc) and returns `"ok": false` with a
+    /// description when it does. Previously this function discarded that
+    /// response body and always returned `Ok(())` regardless -- meaning a
+    /// failed delete of a sensitive message looked identical to a
+    /// successful one to every caller. Now it actually checks `ok` and
+    /// returns `Err` on failure, so callers (see handlers.rs) can warn
+    /// the user their sensitive message is still sitting in the chat.
     pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
-        let _: serde_json::Value = self
+        let resp: TgResponse<serde_json::Value> = self
             .http
             .post(self.url("deleteMessage"))
             .json(&json!({ "chat_id": chat_id, "message_id": message_id }))
@@ -190,6 +208,10 @@ impl TgClient {
             .json()
             .await
             .map_err(|e| self.redact_chain(&e))?;
+        if !resp.ok {
+            let desc = resp.description.unwrap_or_else(|| "unknown error".to_string());
+            return Err(anyhow!("deleteMessage failed: {desc}"));
+        }
         Ok(())
     }
 }

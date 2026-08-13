@@ -360,7 +360,19 @@ impl App {
         // rejects a delete (message already gone, edited, etc) -- that's
         // not worth failing the whole request over.
         if user.awaiting.expects_sensitive_input() {
-            let _ = self.tg.delete_message(chat_id, msg.message_id).await;
+            if let Err(e) = self.tg.delete_message(chat_id, msg.message_id).await {
+                // Don't fail the whole request over this, but don't stay
+                // silent either -- the user just typed a PIN or private
+                // key and needs to know it's still sitting in the chat
+                // if Telegram wouldn't let us remove it (bot lacks admin
+                // rights, message too old, etc).
+                eprintln!("⚠️ Couldn't auto-delete sensitive message for user {telegram_id}: {e}");
+                let _ = self.tg.send_html(
+                    chat_id,
+                    "⚠️ <b>Heads up:</b> I couldn't auto-delete your last message, and it may contain a PIN or private key. Please delete it manually now.",
+                    None,
+                ).await;
+            }
         }
 
         match user.awaiting.clone() {
@@ -407,7 +419,14 @@ impl App {
                             let tg = self.tg.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                                let _ = tg.delete_message(chat_id, mid).await;
+                                if let Err(e) = tg.delete_message(chat_id, mid).await {
+                                    eprintln!("⚠️ Auto-delete of exported private key message failed: {e}");
+                                    let _ = tg.send_html(
+                                        chat_id,
+                                        "⚠️ <b>Heads up:</b> I couldn't auto-delete the message with your private key. Please scroll up and delete it manually.",
+                                        None,
+                                    ).await;
+                                }
                             });
                         }
                     }
@@ -911,7 +930,10 @@ impl App {
         match data {
             "del_msg" => {
                 if let Some(mid) = message_id {
-                    self.tg.delete_message(chat_id, mid).await.ok();
+                    if let Err(e) = self.tg.delete_message(chat_id, mid).await {
+                        eprintln!("⚠️ Manual delete-message button failed: {e}");
+                        let _ = self.tg.send_html(chat_id, "⚠️ Couldn't delete that message — please remove it manually.", None).await;
+                    }
                 }
             }
             "main" | "refresh" => {
